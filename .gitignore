@@ -1,0 +1,11 @@
+# 运行时生成
+certs/
+logs/
+config.json
+
+# 构建产物
+*.exe
+build/
+
+# 其他
+*.lnk

@@ -1,0 +1,3896 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" href="/favicon.png">
+<title>TeaRTC 屏幕共享</title>
+<style>
+  :root { color-scheme: dark; }
+  [hidden] { display: none !important; } /* 防止显式 display 覆盖 hidden 属性 */
+  /* 全局滚动条（深色主题） */
+  * { scrollbar-width: thin; scrollbar-color: #3a4a6a #121a2b; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: #121a2b; }
+  ::-webkit-scrollbar-thumb { background: #3a4a6a; border-radius: 4px; }
+  ::-webkit-scrollbar-thumb:hover { background: #4a5c82; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #0f1420; color: #dde3ee; min-height: 100vh; padding: 16px;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    max-width: 1400px; margin: 0 auto 14px;
+  }
+  header h1 { font-size: 20px; }
+  .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #1d2636; color: #9fb3d1; }
+  .badge.warn { background: #5b3a1e; color: #fbbf24; }
+  input[type=text] {
+    background: #1d2636; color: #dde3ee; border: 1px solid #2a3650;
+    border-radius: 6px; padding: 5px 10px; font-size: 13px; width: 160px;
+  }
+  .grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .pcard {
+    background: #161d2e; border: 1px solid #232e45; border-radius: 16px;
+    overflow: hidden; display: flex; flex-direction: column; position: relative;
+  }
+  .pcard video { width: 100%; aspect-ratio: 16/9; background: #000; display: block; }
+  .rttBadge { position: absolute; top: 8px; right: 8px; z-index: 5; background: rgba(0,0,0,0.65); padding: 1px 7px; border-radius: 9px; font-size: 11px; font-family: Consolas, monospace; color: #8fa3c4; pointer-events: none; }
+  .videoWrap {
+    position: relative;
+    aspect-ratio: 16/9; /* 卡片内 16:9 占位；全屏时被浏览器拉伸覆盖 */
+    display: flex; align-items: center; justify-content: center; /* 真全屏时画面居中 */
+  }
+  .videoWrap video {
+    width: 100%; height: 100%;
+    object-fit: contain; /* 保持原始比例完整显示，黑边居中不裁剪 */
+    background: #000; display: block;
+  }
+  .camWrap {
+    position: relative; aspect-ratio: 16/9;
+    display: flex; align-items: center; justify-content: center;
+    border-top: 1px solid #232e45;
+  }
+  .camWrap video {
+    width: 100%; height: 100%; object-fit: contain; background: #000; display: block;
+  }
+  .camWrap::before {
+    content: '摄像头'; position: absolute; left: 8px; top: 6px; z-index: 2;
+    font-size: 11px; color: #9fb3d1; background: rgba(0,0,0,0.5);
+    padding: 2px 8px; border-radius: 999px; pointer-events: none;
+  }
+  .camWrap:fullscreen::before { display: none; } /* 真全屏画面纯净 */
+  .camStats {
+    position: absolute; left: 8px; bottom: 6px; z-index: 3;
+    display: flex; align-items: center; gap: 6px;
+    font-size: 11px; color: #c7d3ea; background: rgba(0,0,0,0.55);
+    padding: 2px 8px; border-radius: 6px;
+    font-family: Consolas, monospace; white-space: nowrap;
+    pointer-events: auto; cursor: pointer; /* 整个状态条可点击查看详情 */
+    max-width: calc(100% - 16px); /* 不超出视频区 */
+  }
+  .camStats > span:first-child { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .camStats span[data-vdetail], .camStats span[data-cdetail] { color: #e2e8f0; flex: none; }
+  .camStats svg { width: 12px; height: 12px; vertical-align: -1px; }
+  .controls {
+    position: absolute; right: 8px; bottom: 8px; z-index: 5;
+    display: flex; align-items: center; gap: 4px;
+    padding: 4px 6px; border-radius: 8px;
+    background: rgba(0,0,0,0.6);
+    opacity: 0; transition: opacity .2s; pointer-events: none;
+  }
+  .videoWrap:hover .controls, .camWrap:hover .controls { opacity: 1; pointer-events: auto; }
+  @media (hover: none) { .controls { opacity: 1; pointer-events: auto; } }
+  /* 远程控制覆盖层（P2-2）：叠加在视频上捕获鼠标/触控/键盘 */
+  .ctlLayer {
+    position: absolute; inset: 0; z-index: 1;
+    display: none; cursor: crosshair; touch-action: none;
+    outline: none; /* tabindex=0 时隐藏焦点框 */
+  }
+  .ctlLayer.on { display: block; }
+  .ctlLayer .ctlBadge {
+    position: absolute; left: 8px; top: 8px;
+    font-size: 11px; color: #ffd479; background: rgba(0,0,0,0.65);
+    padding: 2px 8px; border-radius: 6px; pointer-events: none; white-space: nowrap;
+  }
+  .controls .ctlBtn.active { color: #ffd479; border-color: #ffd479; }
+  #ctrlBanner {
+    display: flex; align-items: center; justify-content: center; gap: 10px;
+    background: #3a2e1a; color: #ffd479; padding: 8px 12px; font-size: 13px;
+  }
+  #ctrlBanner button { flex: none; }
+  .controls select {
+    background: transparent; color: #fff; border: 0; font-size: 12px; outline: none; cursor: pointer;
+  }
+  .controls select option { background: #1d2636; color: #fff; }
+  .ctrl {
+    background: transparent; border: 0; color: #fff; cursor: pointer;
+    padding: 4px; border-radius: 4px; display: flex;
+  }
+  .ctrl:hover { background: rgba(255,255,255,0.2); }
+  .ctrl.on { color: #60a5fa; }
+  .ctrl svg { width: 18px; height: 18px; }
+  .audioBar {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 8px 12px; border-top: 1px solid #232e45; background: #121a2b;
+  }
+  .chanBar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .chanBar .ctrl { padding: 4px; }
+  .chanBar input[type=range] { width: 90px; accent-color: #2563eb; }
+  .chanBar canvas { background: #0d1322; border-radius: 4px; }
+  .chanWarn.warn { color: #fde68a; } .chanWarn.err { color: #fca5a5; }
+  .audioCfg { border: 1px solid #232e45; border-radius: 8px; padding: 8px 10px; margin-top: 6px; }
+  .audioCfg canvas { background: #0d1322; border-radius: 4px; margin-top: 4px; display: block; }
+  .phead { display: flex; align-items: center; gap: 8px; padding: 10px 12px 4px; font-size: 14px; flex-wrap: wrap; }
+  .dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+  .pname { font-weight: 600; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: #1d2636; color: #9fb3d1; }
+  .pill.on { background: #14532d; color: #86efac; }
+  .pill.host { background: #78350f; color: #fcd34d; } /* 服务器主机徽章 */
+  .pbody { padding: 6px 12px 10px; }
+  .hint { font-size: 12px; color: #8fa3c4; margin: 3px 0; line-height: 1.6; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0; }
+  .btn { display: inline-block; border: 0; border-radius: 8px; padding: 7px 16px; font-size: 13px; cursor: pointer; color: #fff; text-decoration: none; }
+  .btn.primary { background: #2563eb; }
+  .btn.danger { background: #dc2626; }
+  .btn.mini { background: #2a3650; padding: 3px 10px; font-size: 12px; border-radius: 6px; cursor: pointer; color: #c7d3ea; border: 1px solid #2a3650; }
+  .btn.mini.on { background: #2563eb; border-color: #2563eb; color: #fff; }
+  .btn.warn { background: #d97706; } /* 切换目标（黄色） */
+  .btn.idle { background: #3f4757; color: #dde3ee; } /* 未共享（灰色） */
+  .btn.active { background: #fff; color: #111; } /* 共享中（白色） */
+  .btn.iconbtn { padding: 5px 10px; display: inline-flex; align-items: center; }
+  .btn.iconbtn svg { width: 16px; height: 16px; }
+  #myCamVideo { display: block; width: 100%; aspect-ratio: 16/9; background: #000; }
+  .modal {
+    position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.6);
+    display: flex; align-items: center; justify-content: center;
+  }
+  .modal[hidden] { display: none; }
+  .modalBox {
+    background: #161d2e; border: 1px solid #232e45; border-radius: 14px;
+    padding: 16px 18px; width: 440px; max-width: 92vw;
+  }
+  #chatPanel {
+    position: fixed; right: 0; top: 0; bottom: 0; width: 320px; max-width: 92vw;
+    z-index: 90; background: #121a2b; border-left: 1px solid #232e45;
+    display: flex; flex-direction: column;
+  }
+  #chatPanel[hidden] { display: none; }
+  #chatHead {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px; font-size: 14px; font-weight: 600;
+    border-bottom: 1px solid #232e45;
+  }
+  #chatList { flex: 1; overflow-y: auto; padding: 10px 12px; display: flex; flex-direction: column; gap: 16px; }
+  #chatJumpBottom {
+    position: absolute; bottom: 100px; right: 12px; z-index: 5;
+    width: 36px; height: 36px; border-radius: 8px;
+    background: #2563eb; color: #fff; border: 0;
+    cursor: pointer; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+    display: flex; align-items: center; justify-content: center;
+  }
+  #chatJumpBottom svg { width: 18px; height: 18px; }
+  #chatDropOverlay {
+    position: absolute; inset: 0; z-index: 8;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(37,99,235,0.25); border: 2px dashed #60a5fa;
+    border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600;
+    pointer-events: none;
+  }
+  #chatDropOverlay[hidden] { display: none; }
+  #chatPasteQueue { display: flex; flex-wrap: wrap; gap: 6px; padding: 6px 12px; border-top: 1px solid #232e45; }
+  #chatPasteQueue[hidden] { display: none; }
+  .pasteItem { position: relative; display: flex; align-items: center; gap: 6px; background: #1d2636; border: 1px solid #2a3650; border-radius: 8px; padding: 4px 8px; max-width: 200px; }
+  .pasteItem img { width: 40px; height: 40px; object-fit: cover; border-radius: 4px; flex: none; }
+  .pasteItem .pIcon { width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; color: #60a5fa; flex: none; }
+  .pasteItem .pInfo { min-width: 0; }
+  .pasteItem .pName { font-size: 12px; color: #dde3ee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px; }
+  .pasteItem .pSize { font-size: 10px; color: #8fa3c4; }
+  .pasteItem .pDel { position: absolute; top: -6px; right: -6px; width: 16px; height: 16px; border-radius: 50%; background: #ef4444; color: #fff; border: 0; font-size: 11px; line-height: 1; cursor: pointer; padding: 0; }
+  .chatMsg { display: flex; gap: 8px; align-items: flex-start; }
+  .chatMsg .dot { width: 12px; height: 12px; margin-top: 2px; flex: none; }
+  .chatBody { flex: 1; min-width: 0; }
+  .chatMeta { font-size: 11px; color: #8fa3c4; }
+  .chatMeta b { color: #dde3ee; font-weight: 600; }
+  .chatText { font-size: 13px; margin-top: 2px; word-break: break-all; line-height: 1.5; white-space: pre-wrap; }
+  .chatImg { max-width: 100%; max-height: 200px; border-radius: 8px; margin-top: 4px; cursor: zoom-in; display: block; }
+  .chatVideo { max-width: 100%; max-height: 260px; border-radius: 8px; margin-top: 4px; background: #000; display: block; }
+  .chatFile { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: #60a5fa; text-decoration: none; }
+  .chatFile svg { width: 14px; height: 14px; }
+  .chatExpired { display: inline-block; margin-top: 4px; font-size: 12px; color: #6b7c99; }
+  .linkCard {
+    display: flex; gap: 8px; margin-top: 6px; text-decoration: none;
+    border: 1px solid #2a3650; border-radius: 8px; padding: 8px;
+    background: #161d2e; overflow: hidden;
+  }
+  .linkCard img { width: 64px; height: 64px; object-fit: cover; border-radius: 6px; flex: none; }
+  .linkCardBody { min-width: 0; }
+  .linkTitle { font-size: 13px; color: #60a5fa; font-weight: 600; word-break: break-all; }
+  .linkDesc { font-size: 11px; color: #8fa3c4; margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-all; }
+  .chatTime { font-size: 10px; color: #5b6b86; margin-left: 6px; }
+  .modalHead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .modalHead span { font-size: 15px; font-weight: 600; }
+  .modalHead.center { justify-content: center; position: relative; }
+  .modalHead.center span { flex: 1; text-align: center; }
+  .modalHead.center .btn { position: absolute; right: 0; top: 50%; transform: translateY(-50%); }
+  #chatHint { font-size: 11px; color: #6b7c99; padding: 4px 12px; border-bottom: 1px solid #1c2638; }
+  #chatBadge {
+    position: absolute; top: -6px; right: -6px; z-index: 6;
+    min-width: 16px; height: 16px; padding: 0 4px; border-radius: 999px;
+    background: #dc2626; color: #fff; font-size: 10px; line-height: 16px;
+    text-align: center; font-weight: 600; pointer-events: none;
+  }
+  #caBanner {
+    max-width: 1400px; margin: 0 auto 10px;
+    background: #7c2d12; color: #fed7aa; padding: 8px 14px; border-radius: 10px;
+    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  #caBanner[hidden] { display: none; }
+  #hostLostBanner {
+    max-width: 1400px; margin: 0 auto 10px;
+    background: #7c2d12; color: #fed7aa; padding: 8px 14px; border-radius: 10px;
+    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  #hostLostBanner[hidden] { display: none; }
+  #hostLostBanner .hostBtns { display: flex; gap: 8px; flex-wrap: wrap; }
+  #verBanner {
+    max-width: 1400px; margin: 0 auto 10px;
+    background: #1e3a8a; color: #bfdbfe; padding: 8px 14px; border-radius: 10px;
+    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  }
+  #verBanner[hidden] { display: none; }
+  .aboutBody { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
+  .aboutRow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .aboutRow > span:first-child { color: #8fa3c4; flex: none; }
+  .aboutRow .hint { color: #8fa3c4; }
+  .aboutAuthor { text-align: center; font-weight: 600; font-size: 14px; }
+  .aboutLinks { display: flex; justify-content: center; gap: 10px; }
+  .aboutLinks .bili { background: #fb7299; border-color: #fb7299; }
+  .aboutLinks .gh { background: #24292e; border-color: #444c56; }
+  #chatInputRow { display: flex; gap: 6px; padding: 10px 12px; border-top: 1px solid #232e45; align-items: flex-start; }
+  #chatInputRow .btn { height: 34px; } /* 发送/文件按钮等高 */
+  #chatInputWrap { flex: 1; min-width: 0; position: relative; }
+  #chatBtns { display: flex; flex-direction: column; align-items: flex-start; justify-content: flex-end; gap: 4px; flex: none; }
+  .btnRow { display: flex; gap: 6px; }
+  #chatCharCount { font-size: 10px; color: #fff; line-height: 1; }
+  #chatCharCount.full { color: #fde68a; } /* 恰好 2000：黄色 */
+  #chatCharCount.over { color: #fca5a5; }
+  #chatInput {
+    width: 100%;
+    flex: 1; min-width: 0; resize: none; overflow-y: auto;
+    max-height: 120px; line-height: 1.5;
+    background: #1d2636; color: #dde3ee; border: 1px solid #2a3650;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+    font-family: inherit;
+  }
+  #chatInputRow .btn { flex: none; }
+  .mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; background: #0d1322; border: 1px solid #232e45; border-radius: 6px; padding: 3px 8px; }
+  label { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: #9fb3d1; }
+  select {
+    background: #1d2636; color: #dde3ee; border: 1px solid #2a3650;
+    border-radius: 6px; padding: 3px 6px; font-size: 12px;
+  }
+  .stats { font-size: 11px; color: #8fa3c4; font-family: Consolas, monospace; margin-top: 4px; word-break: break-all; }
+  .ok { color: #86efac; } .warn { color: #fde68a; } .err { color: #fca5a5; }
+  details { margin-top: 14px; max-width: 1400px; margin-left: auto; margin-right: auto; }
+  details summary { cursor: pointer; font-size: 13px; color: #9fb3d1; user-select: none; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 16px; font-size: 12px; margin-top: 8px; }
+  .kv dt { color: #8fa3c4; white-space: nowrap; }
+  .kv dd { font-family: Consolas, "Courier New", monospace; word-break: break-all; }
+  pre { font-size: 12px; line-height: 1.8; color: #b7c5de; margin: 6px 0; background: #0d1322; border: 1px solid #232e45; border-radius: 8px; padding: 8px 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .card { background: #161d2e; border: 1px solid #232e45; border-radius: 14px; padding: 14px 16px; max-width: 1400px; margin: 14px auto 0; }
+  .card h2 { font-size: 15px; margin-bottom: 8px; }
+  #cinema {
+    position: fixed; inset: 0; z-index: 100; background: #000;
+    display: flex; flex-direction: column;
+  }
+  #cinema[hidden] { display: none; }
+  #cinemaVideo { flex: 1; width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
+  .cinemaBar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 2;
+    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+    background: linear-gradient(rgba(0,0,0,0.7), transparent);
+  }
+  .cinemaTitle { font-size: 15px; font-weight: 600; color: #fff; }
+  #cinemaBottom {
+    position: absolute; left: 0; right: 0; bottom: 0; z-index: 2;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 12px 14px 14px;
+    background: linear-gradient(transparent, rgba(0,0,0,0.75));
+  }
+  #cinemaStats {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; color: #c7d3ea; font-family: Consolas, monospace;
+    background: rgba(0,0,0,0.55); padding: 4px 10px; border-radius: 8px;
+    cursor: pointer; user-select: none; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  #cinemaStats svg { width: 12px; height: 12px; vertical-align: -1px; }
+  #cinemaStats .detail { color: #e2e8f0; flex: none; }
+  #cinemaControls { display: flex; align-items: center; gap: 4px; flex: none; }
+  #cinemaControls .controls { opacity: 1; pointer-events: auto; position: static; background: transparent; padding: 0; } /* 影院常显（覆盖卡片 hover 隐藏） */
+  #cinemaControls select { background: rgba(0,0,0,0.55); color: #fff; border: 1px solid rgba(255,255,255,0.25); border-radius: 6px; padding: 3px 6px; font-size: 12px; }
+  #cinemaControls .ctrl {
+    background: rgba(0,0,0,0.55); border: 1px solid rgba(255,255,255,0.25); border-radius: 6px;
+    padding: 4px; display: flex;
+  }
+  #cinemaControls .ctrl.on { color: #60a5fa; border-color: #60a5fa; }
+  .netItem { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(255,255,255,0.04); margin-bottom: 6px; font-size: 13px; }
+  .inviteRow { display: flex; margin-bottom: 6px; }
+  .inviteRow .btn { font-size: 12px; }
+  #logBody {
+    max-height: 60vh; overflow: auto; background: #0d1420;
+    border: 1px solid #232e45; border-radius: 8px; padding: 8px 10px;
+    font-size: 12px; line-height: 1.5; color: #c7d3ea;
+    font-family: Consolas, monospace; white-space: pre-wrap; word-break: break-all;
+  }
+  .netItem code { color: #8fa3c4; font-size: 12px; flex: 1; word-break: break-all; }
+  .netItem .btn { flex-shrink: 0; }
+  .netDot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  #netTopoWrap { background: rgba(255,255,255,0.04); border-radius: 8px; max-height: 60vh; overflow: hidden; cursor: grab; touch-action: none; }
+  #netTopoWrap.dragging { cursor: grabbing; }
+  #netTopo { width: 100%; height: auto; display: block; }
+  #netTopo .topoLink { stroke: rgba(251,191,36,0.4); stroke-width: 2.5; }
+  #netTopo .topoNode { cursor: pointer; }
+  #netTopo .topoNode text { font-size: 12px; fill: #fde68a; text-anchor: middle; pointer-events: none; font-weight: 600; }
+  #netTopo .topoNode .addr { font-size: 9px; fill: #8fa3c4; font-weight: 400; }
+  #netTopo .topoNode.sel circle:first-of-type { stroke: #fff; stroke-width: 3; }
+  #netTopo .userLink { stroke: rgba(203,213,225,0.35); stroke-width: 1; }
+  #netTopo .topoUser { cursor: default; }
+  #netTopo .topoUser circle { fill: #cbd5e1; stroke: none; }
+  #netTopo .topoUser.self circle { fill: #fbbf24; }
+  #netTopo .topoUser.self .glow { fill: none; stroke: rgba(251,191,36,0.5); stroke-width: 3; }
+  #netAction { min-height: 30px; display: flex; align-items: center; gap: 10px; font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TeaRTC 屏幕共享</h1>
+  <span class="badge" id="netState">连接中…</span>
+  <span class="badge" id="meBadge"></span>
+  <button class="btn mini iconbtn" id="btnNameCfg" title="设置昵称"></button>
+  <button class="btn mini iconbtn" id="btnNet" title="多主机互联"></button>
+  <button class="btn mini iconbtn" id="btnAbout" title="关于"></button>
+  <button class="btn mini iconbtn" id="btnLog" title="服务器日志"></button>
+  <button class="btn mini iconbtn" id="btnShareAddr" title="分享观看地址"></button>
+  <button class="btn mini iconbtn" id="btnFirewall" title="防火墙与 CA 证书"></button>
+  <span style="position:relative">
+    <button class="btn mini iconbtn" id="btnChat" title="聊天"></button>
+    <span id="chatBadge" hidden></span>
+  </span>
+</header>
+
+<div id="caBanner" hidden>
+  <span>首次访问若提示「证书不受信任」：点击盾牌按钮安装 CA 后<b>完全关闭浏览器重开</b>；或点「高级 → 继续前往」即可使用（部分浏览器共享可能受限）。</span>
+  <button class="btn mini" id="caBannerClose">知道了</button>
+</div>
+
+<div id="hostLostBanner" hidden>
+  <span id="hostLostText"></span>
+  <span class="hostBtns" id="hostLostBtns"></span>
+  <button class="btn mini" id="hostLostClose">继续重试</button>
+</div>
+
+<div id="verBanner" hidden>
+  <span>检测到新版本，建议<b>刷新页面</b>以获得最新功能</span>
+  <button class="btn mini" id="verRefresh">刷新页面</button>
+</div>
+
+<div id="ctrlBanner" hidden>
+  <span id="ctrlBannerText"></span>
+  <button class="btn mini" id="ctrlRevokeBtn">收回控制</button>
+</div>
+
+<div id="ctrlReqModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>远程控制请求</span><button class="btn mini" id="ctrlReqClose">×</button></div>
+    <p class="hint" id="ctrlReqText"></p>
+    <div class="row">
+      <button class="btn primary" id="ctrlAccept">同意</button>
+      <button class="btn" id="ctrlDeny">拒绝</button>
+    </div>
+  </div>
+</div>
+
+<div id="ctrlApplyModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span id="ctrlApplyTitle">远程控制</span><button class="btn mini" id="ctrlApplyClose">×</button></div>
+    <p class="hint" id="ctrlApplyText" style="white-space:pre-line"></p>
+    <div class="row">
+      <button class="btn primary" id="ctrlApplyOk">确认</button>
+      <button class="btn" id="ctrlApplyCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="ctrlInviteModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>邀请对方控制</span><button class="btn mini" id="ctrlInviteClose">×</button></div>
+    <p class="hint">选择一位在线用户，邀请其控制你的屏幕（对方同意后获得控制权，你可随时收回）。</p>
+    <div id="ctrlInviteList"></div>
+  </div>
+</div>
+
+<main class="grid" id="grid"></main>
+
+<div id="chatPanel" hidden>
+  <div id="chatHead"><span>聊天</span><button class="btn mini" id="chatClose">×</button></div>
+  <div id="chatHint">聊天记录上限 100 条（当前 0/100），服务器重启后清空；文件缓存上限 200MB，超限时新文件会清理最旧文件；大文件 60 分钟后可能过期</div>
+  <div id="chatList"></div>
+  <div id="chatDropOverlay" hidden>松开以发送文件</div>
+  <div id="chatPasteQueue" hidden></div>
+  <button id="chatJumpBottom" hidden title="回到最新消息"></button>
+  <div id="chatInputRow">
+    <div id="chatInputWrap">
+      <textarea id="chatInput" rows="2" placeholder="发送消息…（Shift+Enter 发送；回车换行）" maxlength="2000"></textarea>
+    </div>
+    <div id="chatBtns">
+      <div class="btnRow">
+        <button class="btn mini" id="chatSend">发送</button>
+        <button class="btn mini iconbtn" id="chatFileBtn" title="发送图片/文件"></button>
+      </div>
+      <span id="chatCharCount">0/2000</span>
+    </div>
+    <input type="file" id="chatFile" hidden>
+  </div>
+</div>
+
+<div id="cinema" hidden>
+  <div class="cinemaBar">
+    <span class="dot" id="cinemaDot" style="background:#9fb3d1"></span>
+    <span class="cinemaTitle" id="cinemaTitle"></span>
+  </div>
+  <video id="cinemaVideo" autoplay playsinline muted></video>
+  <div id="cinemaBottom">
+    <div id="cinemaStats" title="点击查看详细统计"></div>
+    <div id="cinemaControls"></div>
+  </div>
+</div>
+
+<div id="nameCfgModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>设置昵称</span><button class="btn mini" id="nameCfgClose">×</button></div>
+    <div class="row">
+      <input type="text" id="nameInput" placeholder="输入昵称" maxlength="16">
+      <button class="btn primary" id="btnName">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="aboutModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(420px,92vw)">
+    <div class="modalHead center"><span>关于</span><button class="btn mini" id="aboutClose">×</button></div>
+    <div class="aboutBody">
+      <div class="aboutAuthor">茶清墨刂</div>
+      <div class="aboutLinks">
+        <a class="btn primary mini bili" href="https://space.bilibili.com/388428308" target="_blank" rel="noopener">哔哩哔哩</a>
+        <a class="btn primary mini gh" href="https://github.com/TeaClearInkII/TeaRTC-Share" target="_blank" rel="noopener">GitHub</a>
+      </div>
+      <div class="aboutRow"><span>版本</span><b id="aboutVer">-</b></div>
+      <div class="aboutRow"><span>服务器启动时间</span><span id="aboutStart">-</span></div>
+      <div class="aboutRow"><span>服务器已运行</span><span id="aboutUptime">-</span></div>
+      <div class="aboutRow"><span>页面已打开</span><span id="aboutPageUp">-</span></div>
+      <div class="aboutRow"><span>本地缓存时间</span><span id="aboutCache">-</span></div>
+      <div class="aboutRow" style="margin-top:8px;color:#9fb3d1;font-weight:600"><span>主机网络检测</span><span style="font-weight:400;font-size:11px">（服务器所在电脑）</span></div>
+      <div class="aboutRow"><span>主机 IPv6 地址</span><span id="aboutIpv6Addrs">-</span></div>
+      <div class="aboutRow"><span>主机 IPv6 出站</span><span id="aboutIpv6Route">-</span></div>
+      <div class="aboutRow"><span>主机公网 IPv6</span><span id="aboutIpv6Public">-</span></div>
+      <div class="aboutRow"><span>主机公网 IPv4</span><span id="aboutIpv6Public4">-</span></div>
+      <div class="aboutRow"><span>提示音</span><label style="font-weight:400"><input type="checkbox" id="aboutSound" checked> 启用事件提示音</label></div>
+      <div class="aboutRow"><button class="btn mini" id="aboutLogBtn">打开日志窗口</button></div>
+      <div id="aboutRefresh" hidden style="margin-top:10px;color:#fde68a">检测到服务器已重启，<button class="btn mini" id="aboutRefreshBtn">刷新页面</button></div>
+    </div>
+  </div>
+</div>
+
+<div id="logModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(700px,94vw)">
+    <div class="modalHead"><span>服务器日志</span><button class="btn mini" id="logClose">×</button></div>
+    <div class="row" style="margin-bottom:8px">
+      <button class="btn mini" id="logModeBtn">切换到调试模式</button>
+      <button class="btn mini" id="logClear">清空</button>
+      <span class="hint" id="logModeTxt" style="font-size:11px">调试模式输出详细日志，切换立即生效</span>
+    </div>
+    <pre id="logBody"></pre>
+  </div>
+</div>
+
+<div id="shareModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(520px,92vw)">
+    <div class="modalHead"><span>分享观看地址</span><button class="btn mini" id="shareClose">×</button></div>
+    <div id="shareList"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn primary" id="shareCopyAll" style="flex:1">复制全部</button>
+    </div>
+  </div>
+</div>
+
+<div id="netModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(580px,92vw)">
+    <div class="modalHead"><span>多主机互联拓扑</span><button class="btn mini" id="netClose">×</button></div>
+    <div class="row" style="margin:10px 0">
+      <input type="text" id="netInput" placeholder="手动互联：目标主机地址，如 [2409:...]:7553" style="flex:1">
+      <button class="btn primary" id="btnNetJoin">连接</button>
+    </div>
+    <div id="netTopoWrap">
+      <svg id="netTopo" viewBox="0 0 560 340"></svg>
+    </div>
+    <div id="netHint" style="font-size:12px;color:#8fa3c4;margin:8px 0">打开其他主机的页面即自动互联；点击远端节点可切换主机</div>
+    <div id="netAction"></div>
+  </div>
+</div>
+
+<div id="detailModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span id="detailModalTitle"></span><button class="btn mini" id="detailModalClose">×</button></div>
+    <dl class="kv" id="detailModalBody"></dl>
+  </div>
+</div>
+
+<div id="firewallModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>防火墙与 CA 证书</span><button class="btn mini" id="firewallClose">×</button></div>
+    <h2 style="font-size:14px;margin:4px 0">防火墙放行</h2>
+    <p class="hint">若对方连不上，请以管理员执行防火墙放行（WebRTC 画面还需允许浏览器通过防火墙）。</p>
+    <pre id="fwCmdM"></pre>
+    <div class="row">
+      <button class="btn mini" id="copyFwM">复制防火墙放行命令</button>
+    </div>
+    <h2 style="font-size:14px;margin:10px 0 4px">证书（CA）引导</h2>
+    <p class="hint">本服务使用自建 CA 签发 HTTPS 证书。首次访问时浏览器提示"证书不受信任"：下载 CA 并安装到「受信任的根证书颁发机构」后完全关闭浏览器重开；或复制一键命令在 PowerShell 执行：</p>
+    <pre id="pwshCmdM"></pre>
+    <div class="row">
+      <a class="btn primary" href="/ca.crt" download="teashare-ca.crt">下载 CA 证书</a>
+      <button class="btn mini" id="copyPwshM">复制一键命令</button>
+    </div>
+    <p class="hint">急着观看可先点「高级 → 继续前往」，但共享端在证书未受信时无法采集屏幕。</p>
+  </div>
+</div>
+
+<div id="cfgCfgModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>清晰度设置</span><button class="btn mini" id="cfgCfgClose">×</button></div>
+    <p class="hint">目标编码参数（观看者按档位接收：流畅/高清/超清），共享中修改即时生效。</p>
+    <div class="row">
+      <label>分辨率<select id="cfgRes">
+        <option value="3840x2160">4K</option><option value="2560x1440">2K</option>
+        <option value="1920x1080">1080P</option><option value="1280x720">720P</option>
+      </select></label>
+      <label>帧率<select id="cfgFps">
+        <option value="60">60fps</option><option value="30">30fps</option><option value="24">24fps</option>
+      </select></label>
+      <label>码率<select id="cfgBps">
+        <option value="60000000">60M</option><option value="30000000" selected>30M</option>
+        <option value="15000000">15M</option><option value="8000000">8M</option><option value="4000000">4M</option>
+      </select></label>
+      <label>编码<select id="codecSel">
+        <option value="auto">自动（推荐）</option>
+        <option value="h264">H.264</option>
+        <option value="vp8">VP8</option>
+      </select></label>
+    </div>
+    <p class="hint">高帧率会分摊码率，追求单帧清晰度建议 24/30fps；H.264 优先硬件编码（游戏/视频场景大幅降低 CPU 占用），VP8 兼容最广。<b>该编码设置仅应用于屏幕共享；摄像头固定使用 VP8</b>；屏幕共享中切换需重新选择窗口/屏幕。</p>
+  </div>
+</div>
+
+<div id="micCfgModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>麦克风设置</span><button class="btn mini" id="micCfgClose">×</button></div>    <div class="row">
+      <label>麦克风 <select id="micSrc"><option value="default">默认麦克风</option></select></label>
+    </div>
+    <div class="row">
+      <label>音量 <input type="range" id="micVol" min="0" max="600" value="100"></label>
+      <span class="hint" id="micVolTxt">100%</span>
+      <label>音质 <select id="micQ">
+        <option value="lossless">无损</option>
+        <option value="standard">标准</option>
+        <option value="voice">语音</option>
+      </select></label>
+    </div>
+    <div class="row">
+      <label>智能响度均衡 <input type="checkbox" id="micEq"></label>
+      <label>降噪 <input type="checkbox" id="micDenoise" checked title="取消勾选 = 原始音频（关闭全部自动处理，音质优先）"></label>
+      <span class="hint">取消勾选 = 原始音频（关闭全部自动处理，音质优先）</span>
+    </div>
+    <canvas id="micWave" width="220" height="40"></canvas>
+    <div class="row">
+      <canvas id="micLevel" width="120" height="10"></canvas>
+      <span class="hint" id="micDb">-60dB</span>
+    </div>
+  </div>
+</div>
+
+<div id="camCfgModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>摄像头设置</span><button class="btn mini" id="camCfgClose">×</button></div>
+    <div class="row">
+      <label>摄像头 <select id="camSrc"><option value="default">默认摄像头</option></select></label>
+    </div>
+    <p class="hint">摄像头独立编码参数，共享中修改即时生效。</p>
+    <p class="hint" id="camActual">实际采集：—</p>
+    <div class="row">
+      <label>分辨率<select id="camRes">
+        <option value="1920x1080">1080P</option>
+        <option value="1280x720" selected>720P</option>
+        <option value="640x480">480P</option>
+        <option value="320x240">360P</option>
+      </select></label>
+      <label>帧率<select id="camFps">
+        <option value="60">60fps</option>
+        <option value="30" selected>30fps</option>
+        <option value="15">15fps</option>
+      </select></label>
+      <label>码率<select id="camBps">
+        <option value="8000000">8M</option>
+        <option value="4000000">4M</option>
+        <option value="2000000" selected>2M</option>
+        <option value="1000000">1M</option>
+      </select></label>
+    </div>
+  </div>
+</div>
+
+<div id="sysCfgModal" class="modal" hidden>
+  <div class="modalBox">
+    <div class="modalHead"><span>音频共享设置</span><button class="btn mini" id="sysCfgClose">×</button></div>
+    <p class="hint"><b>仅允许共享标签页音频</b>：窗口/屏幕的系统混合音会产生回声或听到自己麦克风的声音（已禁用）；标签页音频自动隔离，不受影响。</p>
+    <div class="row">
+      <label>音量 <input type="range" id="sysVol" min="0" max="600" value="100"></label>
+      <span class="hint" id="sysVolTxt">100%</span>
+      <label>音质 <select id="sysQ">
+        <option value="lossless">无损</option>
+        <option value="standard">标准</option>
+        <option value="voice">语音</option>
+      </select></label>
+      <label>智能响度均衡 <input type="checkbox" id="sysEq"></label>
+    </div>
+    <canvas id="sysWave" width="220" height="40"></canvas>
+    <div class="row">
+      <canvas id="sysLevel" width="120" height="10"></canvas>
+      <span class="hint" id="sysDb">-60dB</span>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+function fmtRate(bps) {
+  if (bps >= 1048576) return (bps / 1048576).toFixed(2) + 'MB/s';
+  if (bps >= 1024) return (bps / 1024).toFixed(0) + 'KB/s';
+  return (bps > 0 ? bps.toFixed(0) : '0') + 'B/s';
+}
+
+let ws = null, myId = '', myName = '', myColor = '#9fb3d1', myClientId = '', myIsHost = false;
+let nodeId = '', netNodes = [], netTopo = {}, netSel = null, myUsers = [], myRtt = 0, myHostName = '', myIp = ''; // 本节点 id / 互联节点 / 全局拓扑 / 选中节点 / 本节点子用户 / 自己的延迟 / 本节点服务运行者昵称 / 自己的源 IP
+let netLinkRtt = {}; // 节点间延迟矩阵 {nodeId: {neighborId: ms}}
+let hostRtts = {};   // 自己的点到各互联主机的真实延迟 {nodeId: ms}
+let topoTimer = null; // 拓扑弹窗刷新定时器
+let wsRetry = 0;      // 连续断线重连计数（≥5 提示主机断线）
+let lastPongT = 0;    // 最近一次收到 pong 的时间（本地心跳超时检测）
+let pasteQueue = [];  // 聊天粘贴候选 [{file, url}]（面板关闭保留，发送后清空）
+let serverStart = 0, pageStartTs = Date.now(), aboutTimer = null, aboutVerbose = false, serverRestarted = false; // 服务器启动时间戳 / 页面加载时间 / 关于弹窗刷新定时器 / 当前日志模式 / 检测到服务器重启
+let ipv6Info = null; // 主机 IPv6 检测结果（/addrs 下发；关于弹窗展示）
+// 设备判断（须在 init 调用前声明）：iOS Safari 对 H.264 推流有缺陷（视频停帧仅初始关键帧、音频正常）且不支持 simulcast。
+// 强制 VP8 单层低码率推流；服务器已定时发送 REMB/PLI 保活。判断含 iPadOS 桌面模式（Macintosh 触屏 Safari）；
+// Android 走能力检测自动回退，不在此列
+const uaStr = navigator.userAgent;
+const isIOS = /iPhone|iPad|iPod/i.test(uaStr) || (navigator.maxTouchPoints > 0 && /Macintosh/i.test(uaStr) && /Safari/i.test(uaStr) && !/Chrome|Edg/i.test(uaStr));
+const isMobileDevice = isIOS || /Android/i.test(uaStr);
+let topoVB = null; // 拓扑图当前视图（viewBox），节点/尺寸变化时重置
+let panState = { on: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 }; // 拖动平移状态
+let pubPC = null, subPC = null;
+let myStream = null, myTrack = null;
+let iceServers = [], addrList = [], port = 7553;
+let peers = new Map();        // peerId -> info
+let streamOwners = new Map(); // streamId -> ownerId
+let streamCfg = new Map();    // streamId -> {frameRate, bitrate, width, height}（发送端配置）
+let decodeLimit = new Map();  // streamId -> 连续低帧率采样计数
+let streamStart = new Map();  // streamId -> 连接开始时间（ontrack 记录）
+let manualTier = new Map();   // streamId -> 用户手动选择的档位（l/m/h，优先于聚焦逻辑）
+let streamCache = new Map();  // streamId -> MediaStream（ontrack 缓存，渲染后恢复）
+let trackOf = new Map();      // trackId -> streamId（ontrack 记录）
+let midOf = new Map();        // mid -> streamId（双通道匹配兜底）
+let ssrcOf = new Map();       // ssrc -> streamId（服务器下发映射）
+let focused = null;           // 聚焦的 streamId（网页放大）
+let subPending = [];          // subscribe-offer 队列
+let lastResub = 0;            // 订阅 ICE 失败重建防抖
+let wsRtt = null;
+let myWatchers = 0; // 当前观看我的共享的人数
+const appVer = '0.1.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
+
+init();
+
+async function init() {
+  if (isMobileDevice) flashMsg('检测到手机浏览器：摄像头共享已自动使用 VP8 兼容编码'); // 手机环境提示（iOS H.264 缺陷自动回退）
+  await refreshServerState(); // 首次加载：拉取服务器状态（含 serverStart/节点/拓扑）
+  // 断线缓存过期清理（>7 天丢弃，防陈旧地址误导断线引导）
+  try {
+    const nc = JSON.parse(localStorage.getItem('teashare_nodes') || 'null');
+    if (nc && Date.now() - nc.at > 7 * 86400000) localStorage.removeItem('teashare_nodes');
+  } catch (e) {}
+  renderAddrs();
+  saveNodeCache(); // 缓存互联节点地址（断线引导切换用）
+  autoJoinLocal(); // 多主机自动互联：页面自带对方 IPv6（location.origin），本机有服务则自动连入
+  const saved = localStorage.getItem('teashare_name');
+  if (saved) { $('nameInput').value = saved; myName = saved; } // 回填变量，刷新后 hello 携带昵称
+  let cid = localStorage.getItem('teashare_cid');
+  if (!cid) { cid = 'c' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); localStorage.setItem('teashare_cid', cid); }
+  myClientId = cid;
+  $('btnNameCfg').innerHTML = ICON_USER_GEAR;
+  $('btnNet').innerHTML = ICON_NET;
+  $('btnNet').onclick = () => {
+    $('netModal').hidden = false;
+    renderNetTopo();
+    startTopoRefresh();
+  };
+  $('netClose').onclick = () => { $('netModal').hidden = true; stopTopoRefresh(); };
+  $('netModal').addEventListener('click', e => { if (e.target === $('netModal')) { $('netModal').hidden = true; stopTopoRefresh(); } });
+  bindTopoPan(); // 拓扑图拖动平移（内容放不下时）
+  $('btnNetJoin').onclick = async () => {
+    const remote = normJoinRemote($('netInput').value);
+    if (!remote) { $('netHint').textContent = '地址格式无效（示例：[2409:...]:7553）'; return; }
+    $('btnNetJoin').textContent = '连接中…';
+    $('btnNetJoin').disabled = true;
+    try {
+      const r = await fetch('/api/join', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ remote }) });
+      if (!r.ok) throw new Error((await r.text()).trim().split('\n')[0]);
+      $('netInput').value = '';
+    } catch (e) {
+      $('netHint').textContent = '连接失败：' + e.message;
+    } finally {
+      $('btnNetJoin').textContent = '连接';
+      $('btnNetJoin').disabled = false;
+    }
+  };
+  $('netInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnNetJoin').click(); });
+  $('btnShareAddr').innerHTML = ICON_SHARE;
+  $('btnShareAddr').onclick = () => { // 分享观看地址：弹窗可选复制（本机 + 各互联主机）
+    renderShareList();
+    $('shareModal').hidden = false;
+  };
+  $('shareClose').onclick = () => { $('shareModal').hidden = true; };
+  $('shareModal').addEventListener('click', e => { if (e.target === $('shareModal')) $('shareModal').hidden = true; });
+  $('btnFirewall').innerHTML = ICON_SHIELD;
+  $('btnFirewall').onclick = () => { $('firewallModal').hidden = false; };
+  // 回到最新消息按钮：向上滚动时显示，点击回到底部
+  $('chatJumpBottom').innerHTML = ICON_ARROW_DOWN;
+  $('chatList').addEventListener('scroll', () => {
+    const el = $('chatList');
+    $('chatJumpBottom').hidden = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+  });
+  $('chatJumpBottom').onclick = () => { $('chatList').scrollTop = $('chatList').scrollHeight; };
+  // 聊天面板
+  $('btnChat').innerHTML = ICON_CHAT;
+  $('btnChat').onclick = () => {
+    const open = $('chatPanel').hidden;
+    $('chatPanel').hidden = !open;
+    localStorage.setItem('teashare_chat', open ? '1' : '0');
+    if (open) {
+      $('chatList').scrollTop = $('chatList').scrollHeight; // 打开时跳到底部
+      chatUnread = 0; // 打开清零未读
+      updateChatBadge();
+    }
+  };
+  // CA 证书提示横幅（可关闭，本次会话不再显示）
+  $('caBanner').hidden = false;
+  $('caBannerClose').onclick = () => { $('caBanner').hidden = true; };
+  $('hostLostClose').onclick = () => { hideHostLostBanner(); }; // 继续重试（后台仍在重连）
+  $('verRefresh').onclick = () => location.reload();
+  // 关于弹窗
+  $('btnAbout').innerHTML = ICON_INFO;
+  $('btnAbout').onclick = () => {
+    $('aboutModal').hidden = false;
+    fetch('/api/log-level').then(r => r.json()).then(j => { aboutVerbose = !!j.verbose; renderAbout(); }).catch(() => renderAbout());
+  };
+  $('aboutClose').onclick = () => { $('aboutModal').hidden = true; stopAboutTimer(); };
+  $('aboutModal').addEventListener('click', e => { if (e.target === $('aboutModal')) { $('aboutModal').hidden = true; stopAboutTimer(); } });
+  $('aboutRefreshBtn').onclick = () => location.reload();
+  $('aboutLogBtn').onclick = () => { $('aboutModal').hidden = true; stopAboutTimer(); openLog(); };
+  // 日志窗口：打开订阅（拉历史+实时），关闭退订；模式切换 / 清空
+  $('btnLog').innerHTML = ICON_TERMINAL;
+  $('btnLog').onclick = () => { if (logOpen) closeLog(); else openLog(); };
+  $('logClose').onclick = closeLog;
+  $('logModal').addEventListener('click', e => { if (e.target === $('logModal')) closeLog(); });
+  $('logModeBtn').onclick = async () => {
+    try {
+      const r = await fetch('/api/log-level', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ verbose: !aboutVerbose }) });
+      if (r.ok) { aboutVerbose = !aboutVerbose; updateLogModeBtn(); }
+    } catch (e) {}
+  };
+  $('logClear').onclick = () => { $('logBody').textContent = ''; logAcc = 0; };
+  // 提示音开关（关于弹窗）
+  $('aboutSound').checked = soundOn();
+  $('aboutSound').addEventListener('change', e => {
+    localStorage.setItem('teashare_sound', e.target.checked ? '1' : '0');
+  });
+  if (localStorage.getItem('teashare_chat') === '1') $('chatPanel').hidden = false;
+  $('chatClose').onclick = () => { $('chatPanel').hidden = true; localStorage.setItem('teashare_chat', '0'); };
+  $('chatSend').onclick = sendChatText;
+  // 输入框：IME 组合保护 + 2000 上限强制截断 + 自适应高度；手机回车=换行，桌面 Shift+Enter 发送
+  let chatComposing = false;
+  $('chatInput').addEventListener('compositionstart', () => { chatComposing = true; });
+  $('chatInput').addEventListener('compositionend', () => {
+    chatComposing = false;
+    const el = $('chatInput');
+    if (el.value.length > 2000) el.value = el.value.slice(0, 2000); // 组合结束立即截断（防组合中断时超长）
+  });
+  // beforeinput 前置拦截：非组合输入/粘贴超限直接拒绝（保证无法输入第 2001 个字符）
+  $('chatInput').addEventListener('beforeinput', e => {
+    if (chatComposing) return; // IME 组合不拦截
+    if ($('chatInput').value.length >= 2000 && e.data) e.preventDefault();
+  });
+  $('chatInput').addEventListener('blur', () => {
+    chatComposing = false; // 防标志卡死（组合中断/失焦）
+    const el = $('chatInput');
+    if (el.value.length > 2000) el.value = el.value.slice(0, 2000); // 失焦强制截断兜底
+  });
+  // 字数提示（n/2000，恰好 2000 黄色，超限红色警告）
+  const updateCharCount = () => {
+    const n = $('chatInput').value.length;
+    $('chatCharCount').textContent = n > 2000 ? `${n}/2000 超出部分发送时截断` : `${n}/2000`;
+    $('chatCharCount').classList.toggle('full', n === 2000);
+    $('chatCharCount').classList.toggle('over', n > 2000);
+  };
+  $('chatInput').addEventListener('input', () => {
+    updateCharCount();
+    const el = $('chatInput');
+    if (!el.value) {
+      el.style.height = ''; // 为空：恢复默认三行高度（placeholder 完整显示）
+      return;
+    }
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+  });
+  $('chatInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.shiftKey) { e.preventDefault(); sendChatText(); } // Shift+Enter 发送（桌面特征键，移动端无 Shift 不受影响）；其余回车=换行
+  });
+  updateCharCount();
+  $('chatFileBtn').onclick = () => $('chatFile').click();
+  $('chatFileBtn').innerHTML = ICON_FILE;
+  $('chatFile').addEventListener('change', () => {
+    sendChatFile($('chatFile').files[0]);
+    $('chatFile').value = '';
+  });
+  // 粘贴图片/文件 → 进入候选区（待确认发送；纯文本不拦截）
+  $('chatInputWrap').addEventListener('paste', e => {
+    const items = e.clipboardData && e.clipboardData.items;
+    if (!items) return;
+    const files = [];
+    for (const it of items) {
+      if (it.kind === 'file') {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (!files.length) return;
+    e.preventDefault(); // 阻止图片被粘贴为文本
+    for (const f of files) {
+      if (f.size > 100 * 1024 * 1024) { $('netState').textContent = '文件超过 100MB 限制'; continue; }
+      if (pasteQueue.length >= 9) { $('netState').textContent = '候选已达 9 个上限'; break; }
+      pasteQueue.push({ file: f, url: null });
+    }
+    renderPasteQueue();
+  });
+  // 拖放文件发送（聊天面板）
+  $('chatPanel').addEventListener('dragenter', e => { e.preventDefault(); $('chatDropOverlay').hidden = false; });
+  $('chatPanel').addEventListener('dragover', e => { e.preventDefault(); $('chatDropOverlay').hidden = false; });
+  $('chatPanel').addEventListener('dragleave', e => { e.preventDefault(); $('chatDropOverlay').hidden = true; });
+  $('chatPanel').addEventListener('drop', e => {
+    e.preventDefault();
+    $('chatDropOverlay').hidden = true;
+    const files = e.dataTransfer && e.dataTransfer.files;
+    if (files) for (const f of files) sendChatFile(f);
+  });
+  $('firewallClose').onclick = () => { $('firewallModal').hidden = true; };
+  $('firewallModal').addEventListener('click', e => { if (e.target === $('firewallModal')) $('firewallModal').hidden = true; });
+  $('btnNameCfg').onclick = () => { $('nameCfgModal').hidden = false; $('nameInput').focus(); };
+  $('btnName').onclick = () => { setMyName(); $('nameCfgModal').hidden = true; };
+  $('nameInput').addEventListener('keydown', e => { if (e.key === 'Enter') { setMyName(); $('nameCfgModal').hidden = true; } });
+  $('nameCfgClose').onclick = () => { $('nameCfgModal').hidden = true; };
+  $('nameCfgModal').addEventListener('click', e => { if (e.target === $('nameCfgModal')) $('nameCfgModal').hidden = true; });
+  $('detailModalClose').onclick = closeDetail;
+  $('detailModal').addEventListener('click', e => { if (e.target === $('detailModal')) closeDetail(); });
+  $('micCfgClose').onclick = () => { $('micCfgModal').hidden = true; };
+  $('micCfgModal').addEventListener('click', e => { if (e.target === $('micCfgModal')) $('micCfgModal').hidden = true; });
+  $('camCfgClose').onclick = () => { $('camCfgModal').hidden = true; };
+  $('camCfgModal').addEventListener('click', e => { if (e.target === $('camCfgModal')) $('camCfgModal').hidden = true; });
+  // 摄像头设备切换：共享中热替换（replaceTrack，不中断推流）
+  $('camSrc').addEventListener('change', async () => {
+    if (!camPC || !camTrack) return;
+    const deviceId = $('camSrc').value;
+    const videoOpts = {
+      width: { ideal: camCfg.width }, height: { ideal: camCfg.height }, frameRate: { ideal: camCfg.frameRate },
+    };
+    if (deviceId && deviceId !== 'default') videoOpts.deviceId = { exact: deviceId };
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoOpts });
+    } catch (e) { $('camState').textContent = '摄像头切换失败'; return; }
+    const oldTrack = camTrack;
+    camTrack = stream.getVideoTracks()[0];
+    camTrack.onended = () => stopCameraShare();
+    camStream = stream;
+    const sender = camPC.getSenders().find(s => s.track && s.track.kind === 'video');
+    if (sender) await sender.replaceTrack(camTrack).catch(() => {});
+    if (oldTrack) { oldTrack.onended = null; oldTrack.stop(); }
+    $('myCamVideo').srcObject = stream;
+    const st0 = camTrack.getSettings();
+    $('camActual').textContent = `实际采集：${st0.width || '?'}×${st0.height || '?'} @ ${st0.frameRate || '?'}fps（受摄像头硬件限制，目标 ${camCfg.width}×${camCfg.height}）`;
+    updateCamParams().catch(() => {});
+    loadCamSources();
+  });
+  // 编解码器选择（仅屏幕共享；摄像头固定 VP8）：
+  // 屏幕共享中 → 确认后停止并直接弹出窗口/屏幕选择（新编码生效）；未共享 → 下次生效
+  $('codecSel').addEventListener('change', async e => {
+    const prev = codecMode;
+    codecMode = e.target.value;
+    const hadScreen = !!myStream;
+    if (hadScreen) {
+      const ok = confirm('切换编码需重新选择共享窗口/屏幕，当前共享将停止。\n\n【该编码设置仅应用于屏幕共享；摄像头固定使用 VP8】。\n是否继续？');
+      if (!ok) {
+        codecMode = prev; // 取消：回滚编码选择，共享保持
+        $('codecSel').value = prev;
+        return;
+      }
+      stopShare(); // 停止当前屏幕共享
+      $('netState').textContent = '请选择要共享的窗口/屏幕…';
+      try {
+        const stream = await getCaptureStream(); // 直接弹出系统选择（confirm 手势链内），免去手动点按钮
+        setupPublish(stream);
+        $('netState').textContent = '编码器已切换（新共享已开始）';
+      } catch (e) {
+        $('netState').textContent = '未选择窗口/屏幕（若未弹出选择，请点击显示器按钮重新共享）';
+      }
+    } else {
+      $('netState').textContent = '已保存，下次共享生效';
+    }
+  });
+  // 摄像头独立编码参数：共享中修改即时生效
+  ['camRes', 'camFps', 'camBps'].forEach(id => {    $(id).addEventListener('change', () => {
+      const [w, h] = $('camRes').value.split('x').map(Number);
+      camCfg.width = w; camCfg.height = h;
+      camCfg.frameRate = Number($('camFps').value);
+      camCfg.bitrate = Number($('camBps').value);
+      if (camPC) updateCamParams().catch(() => {});
+    });
+  });
+  $('sysCfgClose').onclick = () => { $('sysCfgModal').hidden = true; };
+  $('sysCfgModal').addEventListener('click', e => { if (e.target === $('sysCfgModal')) $('sysCfgModal').hidden = true; });
+  $('cfgCfgClose').onclick = () => { $('cfgCfgModal').hidden = true; };
+  $('cfgCfgModal').addEventListener('click', e => { if (e.target === $('cfgCfgModal')) $('cfgCfgModal').hidden = true; });
+  // 用户交互持续激活所有音频通道（Chrome 自动播放策略：AudioContext 需用户手势后 resume；
+  // 持续监听以覆盖后创建的通道，图标随 ctx.state 自动切换）
+  const resumeAllChannels = () => {
+    document.querySelectorAll('.chanBar').forEach(c => {
+      if (c._wa && c._wa.ctx) c._wa.ctx.resume().catch(() => {});
+    });
+  };
+  document.addEventListener('pointerdown', resumeAllChannels);
+  document.addEventListener('touchstart', resumeAllChannels, { passive: true });
+  connectWS();
+  setInterval(videoStats, 2000);
+  setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) send({ type: 'ping', t: Date.now() }); }, 5000);
+  setInterval(() => {
+    // 本地心跳超时检测：15s 无 pong → 判定死连接 → 主动断开重连
+    // （服务器进程被关闭时 TCP 收不到关闭信号，onclose 要等系统超时；主动断开立即触发重连）
+    if (ws && ws.readyState === WebSocket.OPEN && Date.now() - lastPongT > 15000) ws.close();
+  }, 2000);
+  renderMyCard();
+  // 远程控制：被控端确认/收回 + 申请者确认模态 绑定
+  $('ctrlAccept').onclick = () => respondCtrl(true);
+  $('ctrlDeny').onclick = () => respondCtrl(false);
+  $('ctrlReqClose').onclick = () => respondCtrl(false);
+  $('ctrlRevokeBtn').onclick = revokeCtrl;
+  $('ctrlApplyOk').onclick = () => { const cb = ctrlApplyCb; closeCtrlApply(); if (cb) cb(); };
+  $('ctrlApplyCancel').onclick = closeCtrlApply;
+  $('ctrlApplyClose').onclick = closeCtrlApply;
+  $('ctrlInviteClose').onclick = () => { $('ctrlInviteModal').hidden = true; };
+  $('ctrlInviteModal').addEventListener('click', e => { if (e.target === $('ctrlInviteModal')) $('ctrlInviteModal').hidden = true; });
+}
+
+function setMyName() {
+  myName = $('nameInput').value.trim();
+  localStorage.setItem('teashare_name', myName);
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    send({ type: 'hello', name: myName, enterHost: location.hostname.replace(/^\[|\]$/g, '') });
+  }
+  renderMyCard();
+}
+
+function send(m) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(m)); }
+
+function connectWS() {
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
+  ws.onopen = () => {
+    wsRetry = 0; // 连接恢复：重置断线计数并隐藏提示
+    lastPongT = Date.now(); // 初始化心跳窗口
+    hideHostLostBanner();
+    refreshServerState(); // 重连后刷新服务器状态（serverStart/节点/拓扑，检测重启）
+    $('netState').textContent = '已连接';
+    sndReconnect();
+    send({ type: 'hello', name: myName || undefined, clientId: myClientId, enterHost: location.hostname.replace(/^\[|\]$/g, '') });
+  };
+  ws.onmessage = ev => { try { onMessage(JSON.parse(ev.data)); } catch (e) {} };
+  ws.onclose = () => {
+    wsRetry++;
+    sndDisconnectThrottled();
+    $('netState').textContent = `连接断开，2 秒后重连…（第 ${wsRetry} 次）`;
+    if (wsRetry >= 5) showHostLostBanner(); // 连续重连失败（约 10s）：提示主机断线并引导切换
+    setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => ws.close();
+}
+
+// 拉取服务器状态（/addrs）：初始化与重连成功后共用；
+// 检测服务器重启（启动时间晚于本地缓存）→ 显示「建议刷新」横幅（重连后自动更新缓存时间）
+async function refreshServerState() {
+  try {
+    const r = await fetch('/addrs');
+    const d = await r.json();
+    addrList = d.addrs || [];
+    port = d.port || 7553;
+    iceServers = d.iceServers || [];
+    nodeId = d.nodeId || '';
+    myHostName = d.myHostName || '';
+    netNodes = d.nodes || [];
+    netTopo = d.topo || {};
+    myUsers = d.myUsers || [];
+    netLinkRtt = d.linkRtts || {};
+    if (d.ipv6) ipv6Info = d.ipv6; // 主机 IPv6 检测结果（关于弹窗展示）
+    if (d.serverStart) {
+      const savedStart = localStorage.getItem('teashare_server_start');
+      if (savedStart && d.serverStart > Number(savedStart)) serverRestarted = true;
+      serverStart = d.serverStart;
+      localStorage.setItem('teashare_server_start', String(d.serverStart));
+    }
+    if (serverRestarted) $('verBanner').hidden = false;
+  } catch (e) {}
+}
+
+// 互联节点地址缓存（localStorage）：断线后引导切换到其他主机
+function saveNodeCache() {
+  try {
+    localStorage.setItem('teashare_nodes', JSON.stringify({ at: Date.now(), cur: location.origin, nodes: netNodes, rtts: hostRtts }));
+  } catch (e) {}
+}
+
+function showHostLostBanner() {
+  const banner = $('hostLostBanner');
+  if (!banner || banner.hidden === false) return;
+  let cache = null;
+  try { cache = JSON.parse(localStorage.getItem('teashare_nodes') || 'null'); } catch (e) {}
+  const nodes = (cache && cache.nodes) || [];
+  const others = nodes.filter(n => n.remote && n.remote !== location.origin);
+  $('hostLostText').textContent = '当前主机连接已断开';
+  const btns = $('hostLostBtns');
+  if (others.length) {
+    // 按缓存延迟选最优节点（有 rtts 数据时标记「建议切换」）
+    const rtts = (cache && cache.rtts) || {};
+    const bestId = Object.keys(rtts).length ? others.reduce((a, b) => (rtts[b.id] || 9999) < (rtts[a.id] || 9999) ? b : a) : null;
+    btns.innerHTML = others.map(n => {
+      const url = 'https://' + (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+      const rec = bestId && bestId.id === n.id && rtts[n.id] > 0 ? '（建议切换 ' + rtts[n.id] + 'ms）' : '';
+      return `<button class="btn primary mini" data-open="${escapeHtml(url)}">打开互联主机${rec}</button>`;
+    }).join('');
+  } else {
+    btns.innerHTML = '';
+  }
+  btns.querySelectorAll('[data-open]').forEach(b => {
+    b.onclick = () => window.open(b.dataset.open, '_blank'); // 确认后打开其他主机
+  });
+  sndDisconnectThrottled(); // 主机断线横幅出现：提示音（节流）
+  banner.hidden = false;
+}
+
+function hideHostLostBanner() {
+  const banner = $('hostLostBanner');
+  if (banner) banner.hidden = true;
+}
+
+function onMessage(m) {
+  switch (m.type) {
+    case 'welcome':
+      myId = m.id;
+      myName = m.name;
+      myColor = m.color;
+      myIsHost = !!m.host;
+      myIp = m.ip || '';
+      $('meBadge').style.background = ''; // 深色徽章背景，前置用户色圆点标识
+      $('meBadge').innerHTML = `<span class="dot" style="background:${myColor};display:inline-block;vertical-align:middle;margin-right:6px"></span>${escapeHtml(myName)}（${myId}）`;
+      peers.clear();
+      streamOwners.clear();
+      streamCfg.clear();
+      (m.peers || []).forEach(p => peers.set(p.id, p));
+      (m.streams || []).forEach(s => {
+        streamOwners.set(s.id, s.ownerId);
+        if (s.config) streamCfg.set(s.id, s.config);
+      });
+      renderMyCard(); // host 身份确定后重建（邀请控制按钮仅 host 显示）
+      renderGrid();
+      updateMyHostLine();
+      break;
+    case 'share-config':
+      if (m.ownerId !== myId) streamCfg.set(m.ownerId, { frameRate: m.frameRate, bitrate: m.bitrate, width: m.width, height: m.height });
+      break;
+    case 'peer-joined':
+      if (m.id === myId) break; // 忽略自己
+      peers.set(m.id, { id: m.id, name: m.name, color: m.color, sharing: false, host: m.host, ip: m.ip, enterHost: m.enterHost || '', hostId: m.hostId || '' });
+      sndUserJoin();
+      renderGrid();
+      break;
+    case 'peer-left':
+      if (m.id === myId) break;
+      peers.delete(m.id);
+      sndUserLeave();
+      for (const [, p] of peers) { if (p.hostId === m.id) p.hostId = ''; } // 所属节点服务用户离线
+      renderGrid();
+      updateMyHostLine();
+      break;
+    case 'host-updated':
+      for (const [, p] of peers) { if (!p.host && !p.hostId) p.hostId = m.id; } // 服务运行者上线补填
+      renderGrid();
+      updateMyHostLine();
+      break;
+    case 'node-info':
+      if (m.nodeId) nodeId = m.nodeId; // /addrs 失败兜底：node-info 补全本节点 id
+      if (m.myHostName !== undefined) myHostName = m.myHostName || '';
+      netNodes = m.nodes || [];
+      if (m.topo) netTopo = m.topo;
+      if (m.myUsers) myUsers = m.myUsers;
+      if (m.linkRtts) netLinkRtt = m.linkRtts;
+      saveNodeCache(); // 互联节点变化时更新缓存
+      renderNetTopo();
+      break;
+    case 'stream-added':
+      streamOwners.set(m.id, m.ownerId);
+      if (m.ownerId !== myId) sndStreamAdded(); // 他人开始共享：提示
+      renderGrid();
+      break;
+    case 'stream-removed':
+      if (m.id === myId) { closePublish(); }
+      streamOwners.delete(m.id);
+      streamCache.delete(m.id);
+      streamCfg.delete(m.id);
+      decodeLimit.delete(m.id);
+      streamStart.delete(m.id);
+      manualTier.delete(m.id);
+      _streamRate.delete(m.id);
+      for (const [tid, sid] of trackOf) { if (sid === m.id) trackOf.delete(tid); }
+      for (const [mid, sid] of midOf) { if (sid === m.id) midOf.delete(mid); }
+      for (const [ssrc, sid] of ssrcOf) { if (sid === m.id) ssrcOf.delete(ssrc); }
+      if (m.ownerId) { // 清理该用户全部音频通道缓存（流 id 为 ownerId 或 ownerId-a）
+        for (const k of audioCache.keys()) { if (k.startsWith(m.ownerId + '-')) audioCache.delete(k); }
+      }
+      if (watchMode && watchMode.id === m.id) deactivateWatch(watchMode.kind);
+      renderGrid();
+      break;
+    case 'stream-audio-removed':
+      // 视频流仍在，仅音频通道移除（观看端对应卡片的音频停止）
+      if (m.ownerId && m.kind) audioCache.delete(m.ownerId + '-' + m.kind);
+      renderGrid();
+      break;
+    case 'publish-answer':
+      if (m.pc === 'camera') {
+        if (camPC) camPC.setRemoteDescription(new RTCSessionDescription(m.sdp)).catch(() => {});
+      } else if (m.pc === 'audio-mic' || m.pc === 'audio-system') {
+        const kind = m.pc === 'audio-mic' ? 'mic' : 'system';
+        if (audioPubPCs[kind]) audioPubPCs[kind].setRemoteDescription(new RTCSessionDescription(m.sdp)).catch(() => {});
+      } else if (pubPC) {
+        pubPC.setRemoteDescription(new RTCSessionDescription(m.sdp)).catch(() => {});
+      }
+      break;
+    case 'subscribe-offer':
+      handleSubscribeOffer(m);
+      break;
+    case 'candidate':
+      const cpc = m.pc === 'publish' ? pubPC
+        : (m.pc === 'camera' ? camPC
+        : (m.pc === 'audio-mic' ? audioPubPCs.mic
+        : (m.pc === 'audio-system' ? audioPubPCs.system : subPC)));
+      if (cpc) cpc.addIceCandidate(new RTCIceCandidate(m.candidate)).catch(() => {});
+      break;
+    case 'pong':
+      if (typeof m.t === 'number') { wsRtt = Date.now() - m.t; lastPongT = Date.now(); } // 心跳存活刷新
+      break;
+    case 'ping': // 服务器主动探测延迟：回 pong
+      send({ type: 'pong', t: m.t });
+      break;
+    case 'peer-rtts': // 各用户与其主机的延迟（卡片右上角角标）
+      for (const [id, rtt] of Object.entries(m.rtts || {})) {
+        const el = document.getElementById('rtt-' + (id === myId ? 'me' : id));
+        if (el) setRttBadge(el, rtt);
+        if (id === myId) myRtt = rtt;
+        else {
+          const p = peers.get(id);
+          if (p) p.rtt = rtt; // 缓存：renderGrid 重建后恢复
+        }
+      }
+      if (!$('netModal').hidden) renderNetTopo(); // 拓扑延迟标签实时刷新
+      break;
+    case 'watchers':
+      if (m.ownerId === myId) myWatchers = m.count || 0;
+      break;
+    case 'ctrl':
+      handleCtrlMsg(m);
+      break;
+    case 'chat':
+      appendChatMsg(m);
+      if ($('chatPanel').hidden) sndChat(); // 面板关闭时提示（与未读角标一致）
+      break;
+    case 'chat-history':
+      handleChatHistory(m);
+      break;
+    case 'log': // 服务器日志实时行
+      appendLogLine(m.line);
+      break;
+    case 'log-history': // 日志窗口历史（订阅时下发）
+      if (logOpen) { (m.lines || []).forEach(l => appendLogLine(l)); }
+      break;
+    case 'error':
+      $('netState').textContent = m.message;
+      break;
+  }
+}
+
+
+async function handleSubscribeOffer(m) {
+  try {
+    // 记录服务器下发的流映射（id -> SSRC），统计按 SSRC 匹配兜底
+    if (m.streams && m.streams.length) {
+      m.streams.forEach(s => { if (s.ssrc) ssrcOf.set(s.ssrc, s.id); });
+    }
+    if (subPC && subPC.connectionState === 'closed') subPC = null;
+    if (!subPC) {
+      subPC = new RTCPeerConnection({ iceServers });
+      subPC.onicecandidate = e => {
+        if (e.candidate) send({ type: 'candidate', pc: 'subscribe', candidate: e.candidate.toJSON() });
+      };
+      // 订阅 ICE 失败：重建订阅连接（30s 防抖），解决首次订阅 ICE 偶发未连通导致黑屏
+      subPC.oniceconnectionstatechange = () => {
+        if (subPC && subPC.iceConnectionState === 'failed' && subPC.connectionState !== 'closed') {
+          const now = Date.now();
+          if (now - (lastResub || 0) > 30000) {
+            lastResub = now;
+            console.warn('订阅连接 ICE 失败，重建中…');
+            try { subPC.close(); } catch (e) {}
+            subPC = null;
+            send({ type: 'resubscribe' });
+          }
+        }
+      };
+      subPC.ontrack = e => {
+        const sid = e.streams[0] && e.streams[0].id;
+        if (sid) {
+          if (sid === myId || sid.startsWith(myId + '-')) return; // 忽略自己的流（服务器已跳过，前端兜底）
+          if (sid.includes('-a-')) {
+            // 音频通道（ownerId-a-kind）：独立通道条
+            const parts = sid.split('-');
+            streamStart.set(sid, Date.now());
+            trackOf.set(e.track.id, sid);
+            const mid = e.transceiver && e.transceiver.mid;
+            if (mid) midOf.set(mid, sid);
+            addAudioChannel(parts[0], parts[2], e.streams[0]);
+            audioCache.set(parts[0] + '-' + parts[2], e.streams[0]); // 缓存音频流（renderGrid 重建后恢复）
+            return;
+          }
+          streamCache.set(sid, e.streams[0]);
+          streamStart.set(sid, Date.now());
+          trackOf.set(e.track.id, sid);
+          const mid = e.transceiver && e.transceiver.mid;
+          if (mid) midOf.set(mid, sid);
+          const v = mediaElOf(sid);
+          if (v) v.srcObject = e.streams[0];
+          const ownerId = sid.endsWith('-a') ? sid.slice(0, -2) : sid;
+          if (focused === sid) $('cinemaVideo').srcObject = e.streams[0]; // 影院模式同步
+        }
+      };
+    }
+    if (subPC.signalingState !== 'stable') { subPending.push(m); return; }
+    await subPC.setRemoteDescription(new RTCSessionDescription(m.sdp));
+    const answer = await subPC.createAnswer();
+    await subPC.setLocalDescription(answer);
+    send({ type: 'subscribe-answer', sdp: subPC.localDescription.toJSON() });
+    if (subPending.length) handleSubscribeOffer(subPending.shift());
+  } catch (err) {
+    console.error('subscribe-offer 处理失败:', err);
+    $('netState').textContent = '订阅协商失败，重试中…';
+    // 重建订阅连接重试
+    if (subPC) { try { subPC.close(); } catch (e) {} }
+    subPC = null;
+    setTimeout(() => { if (streamOwners.size) handleSubscribeOffer(m); }, 1500);
+  }
+}
+
+/* ---------- 我的卡片 ---------- */
+
+function renderMyCard() {
+  const old = document.getElementById('myCard');
+  if (old) old.remove(); // 重建前移除旧卡片（避免重复 myCard 导致用户名/状态不更新）
+  const el = document.createElement('section');
+  el.className = 'pcard';
+  el.id = 'myCard';
+  el.innerHTML = `
+    <div class="phead"><span class="dot" style="background:${myColor}"></span>
+      <span class="pname">我${myName ? '（' + myName + '）' : ''}</span>
+      <span class="pill" id="myPill">屏幕未共享</span>
+    </div>
+    <span class="rttBadge" id="rtt-me">—</span>
+    <video id="myVideo" autoplay playsinline muted hidden></video>
+    <video id="myCamVideo" autoplay playsinline muted hidden></video>
+    <div class="pbody">
+      <div class="row">
+        <button class="btn idle iconbtn" id="btnStart" title="开始共享屏幕">${ICON_MONITOR}</button>
+        <button class="btn warn iconbtn" id="btnSwitch" hidden title="切换共享目标">${ICON_MONITOR_GEAR}</button>
+        <button class="btn mini iconbtn" id="btnCfg" title="清晰度设置">${ICON_QUALITY_GEAR}</button>
+        ${myIsHost ? `<button class="btn mini iconbtn" id="btnInviteCtl" hidden title="邀请对方控制你的屏幕">${ICON_CTL}</button>` : ''}
+      </div>
+      <div class="row">
+        <button class="btn idle iconbtn" id="btnCam" title="共享摄像头">${ICON_CAM}</button>
+        <button class="btn mini iconbtn" id="btnCamCfg" title="摄像头设置">${ICON_CAM_GEAR}</button>
+        <span class="status" id="camState">摄像头未共享</span>
+      </div>
+      <div class="row">
+        <button class="btn idle iconbtn" id="btnMic" title="共享麦克风">${ICON_MIC}</button>
+        <button class="btn mini iconbtn" id="btnMicCfg" title="麦克风设置">${ICON_MIC_GEAR}</button>
+        <span class="status" id="micState">麦克风未共享</span>
+      </div>
+      <div class="row">
+        <button class="btn idle iconbtn" id="btnSys" title="共享标签页音频">${ICON_MUSIC}</button>
+        <button class="btn mini iconbtn" id="btnSysCfg" title="音频共享设置">${ICON_MUSIC_GEAR}</button>
+        <span class="status" id="sysState">音频未共享</span>
+      </div>
+      <p class="stats" id="myHostLine"></p>
+      <p class="stats" id="myStats">等待连接…</p>
+    </div>`;
+  const grid = $('grid');
+  grid.appendChild(el);
+  el.querySelector('#btnStart').onclick = () => { if (myStream) stopShare(); else startShare(); };
+  el.querySelector('#btnSwitch').onclick = restartCapture;
+  el.querySelector('#btnCam').onclick = toggleCameraShare;
+  el.querySelector('#btnMic').onclick = () => toggleAudioShare('mic');
+  el.querySelector('#btnSys').onclick = () => toggleAudioShare('system');
+  el.querySelector('#btnMicCfg').onclick = () => { $('micCfgModal').hidden = false; };
+  el.querySelector('#btnCamCfg').onclick = () => { $('camCfgModal').hidden = false; };
+  el.querySelector('#btnSysCfg').onclick = () => { $('sysCfgModal').hidden = false; };
+  el.querySelector('#btnCfg').onclick = () => { $('cfgCfgModal').hidden = false; };
+  const invBtn = el.querySelector('#btnInviteCtl');
+  if (invBtn) invBtn.onclick = openInviteModal; // host 专属：邀请对方控制（按钮随 myIsHost 渲染）
+  loadMicSources();
+  loadCamSources();
+  // 音频设置绑定（麦克风/摄像头/音频设置均位于模态弹窗内）
+  $('micVol').addEventListener('input', e => setSendVol('mic', Number(e.target.value)));
+  $('sysVol').addEventListener('input', e => setSendVol('system', Number(e.target.value)));
+  $('micEq').addEventListener('change', e => setSendEq('mic', e.target.checked));
+  $('sysEq').addEventListener('change', e => setSendEq('system', e.target.checked));
+  $('micQ').addEventListener('change', e => setAudioQuality('mic', e.target.value));
+  $('sysQ').addEventListener('change', e => setAudioQuality('system', e.target.value));
+  $('micEq').disabled = true; // 默认无损档，智能均衡禁用
+  $('sysEq').disabled = true;
+  $('micDenoise').addEventListener('change', async e => {
+    audioSettings.mic.denoise = e.target.checked;
+    if (audioPubPCs.mic) { // 共享中：重新采集应用降噪约束
+      stopAudioShare('mic');
+      await toggleAudioShare('mic');
+    }
+  });
+  ['cfgRes', 'cfgFps', 'cfgBps'].forEach(id => {
+    $(id).addEventListener('change', async () => {
+      const oldCfg = { ...sharerCfg };
+      const [w, h] = $('cfgRes').value.split('x').map(Number);
+      sharerCfg.width = w; sharerCfg.height = h;
+      sharerCfg.frameRate = Number($('cfgFps').value);
+      sharerCfg.bitrate = Number($('cfgBps').value);
+      if (!myStream) return;
+      // 动态编码参数切换（分辨率/帧率/码率，无弹窗）
+      try {
+        await updateSenderParams();
+        sendShareConfig();
+      } catch (e) {
+        // 动态切换失败（个别浏览器限制）：回退重新采集（会弹窗选择）
+        $('myStats').textContent = '动态切换失败，回退重新采集…';
+        await restartCapture();
+        Object.assign(sharerCfg, oldCfg);
+        $('cfgRes').value = oldCfg.width + 'x' + oldCfg.height;
+        $('cfgFps').value = oldCfg.frameRate;
+        $('cfgBps').value = oldCfg.bitrate;
+      }
+    });
+  });
+  updateMyHostLine();
+}
+
+// 我的卡片常驻信息：我的源 IP - 主机（服务运行者昵称，无则服务器 IP）
+function updateMyHostLine() {
+  const el = document.getElementById('myHostLine');
+  if (!el) return;
+  const myAddr = location.hostname.replace(/^\[|\]$/g, '');
+  let hostTxt;
+  if (myIsHost) {
+    hostTxt = myName || myAddr; // 我是服务运行者 → 自己的昵称（无则服务器 IP）
+  } else {
+    const h = [...peers.values()].find(p => p.host); // 本节点服务运行者
+    hostTxt = h ? h.name : myAddr; // 无 → 服务器 IP（页面所在服务）
+  }
+  el.textContent = `我的 IP：${myIp || '-'} - 主机：${hostTxt}`;
+}
+
+// 上报编码配置（供接收端按发送端目标帧率判断解码受限）
+function sendShareConfig() {
+  if (!myStream) return;
+  const s = myTrack.getSettings();
+  send({
+    type: 'share-config',
+    frameRate: sharerCfg.frameRate,
+    bitrate: sharerCfg.bitrate,
+    width: s.width || sharerCfg.width,
+    height: s.height || sharerCfg.height,
+  });
+}
+
+/* ---------- 独立音频共享（麦克风 / 标签页音频双通道，可共存；Web Audio 处理链） ---------- */
+
+let audioPubPCs = {}; // kind(mic/system) -> pc
+let audioTracks = {}; // kind -> track（原始采集）
+let audioChains = {}; // kind -> {ctx, source, highpass, compressor, gain, analyser, dest, raf}
+const audioSettings = { mic: { volume: 100, eq: false, denoise: true, quality: 'lossless' }, system: { volume: 100, eq: false, quality: 'lossless' } };
+
+function buildAudioChain(kind, rawStream, sampleRate) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx(sampleRate ? { sampleRate: sampleRate } : undefined);
+  const source = ctx.createMediaStreamSource(rawStream);
+  const highpass = ctx.createBiquadFilter(); // 降噪（保留）
+  highpass.type = 'highpass'; highpass.frequency.value = 80;
+  const analyserSrc = ctx.createAnalyser(); // 监测（透明，不改变信号）
+  analyserSrc.fftSize = 1024;
+  const agcGain = ctx.createGain(); // 标准档智能均衡用（默认不接入）
+  agcGain.gain.value = 1;
+  const compressor = ctx.createDynamicsCompressor(); // 标准档智能均衡用（默认不接入）
+  const gain = ctx.createGain();
+  const safetyComp = ctx.createDynamicsCompressor(); // 安全网：-24dB 以下完全透明，高增益接近满幅时防削波
+  safetyComp.threshold.value = -24;
+  safetyComp.ratio.value = 12;
+  safetyComp.attack.value = 0.001;
+  safetyComp.release.value = 0.1;
+  const analyser = ctx.createAnalyser(); // 波形/响度（透明）
+  analyser.fftSize = 1024;
+  const dest = ctx.createMediaStreamDestination();
+  // 无损拓扑（默认）：source → highpass(降噪) → analyserSrc → gain → safetyComp → analyser → dest
+  source.connect(highpass);
+  highpass.connect(analyserSrc);
+  analyserSrc.connect(gain);
+  gain.connect(safetyComp);
+  safetyComp.connect(analyser);
+  analyser.connect(dest);
+  return { ctx, source, highpass, compressor, agcGain, gain, safetyComp, analyser, analyserSrc, dest, q: 'lossless' };
+}
+
+// 发送端拓扑切换：无损（仅增益+安全网）↔ 标准（接入智能均衡）
+function applySendTopology(kind, standard) {
+  const ch = audioChains[kind];
+  if (!ch) return;
+  try {
+    try { ch.analyserSrc.disconnect(ch.gain); } catch (e) {}
+    try { ch.analyserSrc.disconnect(ch.agcGain); } catch (e) {}
+    try { ch.agcGain.disconnect(ch.compressor); } catch (e) {}
+    try { ch.compressor.disconnect(ch.gain); } catch (e) {}
+    if (standard) {
+      ch.analyserSrc.connect(ch.agcGain);
+      ch.agcGain.connect(ch.compressor);
+      ch.compressor.connect(ch.gain);
+      ch.q = 'standard';
+    } else {
+      ch.analyserSrc.connect(ch.gain);
+      ch.q = 'lossless';
+    }
+  } catch (e) {}
+}
+
+const sendAgcTimer = {};
+
+function setSendVol(kind, v) {
+  audioSettings[kind].volume = v;
+  const t = document.getElementById(kind === 'mic' ? 'micVolTxt' : 'sysVolTxt');
+  if (t) t.textContent = v + '%';
+  const ch = audioChains[kind];
+  if (ch) ch.gain.gain.setTargetAtTime(v / 100, ch.ctx.currentTime + 0.05, 0.05); // 平滑过渡
+}
+
+// 智能响度均衡（compressor + AGC 闭环；仅标准档有效，无损档拓扑无此节点）
+function setSendEq(kind, on) {
+  audioSettings[kind].eq = on;
+  const ch = audioChains[kind];
+  if (!ch || ch.q !== 'standard') return;
+  try {
+    if (on) {
+      ch.compressor.threshold.value = -30;
+      ch.compressor.ratio.value = 4;
+      if (!sendAgcTimer[kind]) sendAgcTimer[kind] = setInterval(() => {
+        const c = audioChains[kind];
+        if (!c || c.q !== 'standard') return;
+        const rms = getRMS(c.analyserSrc);
+        if (rms < 0.01) return;
+        let next = Math.max(0.5, Math.min(8, 0.3 / rms)); // 目标响度 RMS 0.3
+        const cur = c.agcGain.gain.value;
+        const maxDelta = Math.max(cur * 0.5, 0.1); // 变化速率限制 ±50%
+        if (next > cur + maxDelta) next = cur + maxDelta;
+        if (next < cur - maxDelta) next = cur - maxDelta;
+        c.agcGain.gain.setTargetAtTime(next, c.ctx.currentTime + 0.1, 0.5); // 未来时间+平滑
+      }, 200);
+    } else {
+      ch.compressor.threshold.value = 0; // 透明（不压缩）
+      ch.compressor.ratio.value = 1;
+      ch.agcGain.gain.setTargetAtTime(1, ch.ctx.currentTime + 0.1, 0.5);
+      if (sendAgcTimer[kind]) { clearInterval(sendAgcTimer[kind]); delete sendAgcTimer[kind]; }
+    }
+  } catch (e) {}
+}
+
+function drawSendWave(kind) {
+  const ch = audioChains[kind];
+  const canvas = document.getElementById(kind === 'mic' ? 'micWave' : 'sysWave');
+  if (!ch || !canvas) return;
+  const g = canvas.getContext('2d');
+  const data = new Uint8Array(ch.analyser.fftSize);
+  ch.analyser.getByteTimeDomainData(data);
+  g.clearRect(0, 0, canvas.width, canvas.height);
+  g.strokeStyle = '#60a5fa'; g.lineWidth = 1; g.beginPath();
+  const step = canvas.width / data.length;
+  for (let i = 0; i < data.length; i++) {
+    const y = (data[i] - 128) / 128 * (canvas.height / 2) + canvas.height / 2;
+    i ? g.lineTo(i * step, y) : g.moveTo(0, y);
+  }
+  g.stroke();
+  // 响度条 + dB（推流输出电平）
+  const level = document.getElementById(kind === 'mic' ? 'micLevel' : 'sysLevel');
+  const dbTxt = document.getElementById(kind === 'mic' ? 'micDb' : 'sysDb');
+  if (level && dbTxt) {
+    const rms = getRMS(ch.analyser);
+    const lg = level.getContext('2d');
+    lg.clearRect(0, 0, level.width, level.height);
+    const w = Math.max(1, Math.floor(level.width * Math.min(1, rms / 0.9)));
+    lg.fillStyle = rms > 0.7 ? '#fca5a5' : rms > 0.4 ? '#fde68a' : '#86efac';
+    lg.fillRect(0, 0, w, level.height);
+    dbTxt.textContent = rmsToDb(rms) + 'dB' + (rms > 0.9 ? ' ⚠可能削波，请降低增益或调高系统/麦克风音量' : '');
+  }
+  ch.raf = requestAnimationFrame(() => drawSendWave(kind));
+}
+
+// 音质档位切换：无损（仅增益，波形不变）/ 标准（智能均衡+软膝）/ 语音（32kHz 重采样）
+function setAudioQuality(kind, q) {
+  audioSettings[kind].quality = q;
+  const ch = audioChains[kind];
+  const eqBox = document.getElementById(kind === 'mic' ? 'micEq' : 'sysEq');
+  if (eqBox) eqBox.disabled = (q === 'lossless'); // 无损档禁用智能均衡（不变形）
+  if (!ch) return;
+  if (q === 'lossless') {
+    if (audioSettings[kind].eq) {
+      if (eqBox) eqBox.checked = false;
+      setSendEq(kind, false);
+    }
+    applySendTopology(kind, false);
+  } else if (q === 'standard') {
+    applySendTopology(kind, true);
+    if (audioSettings[kind].eq) setSendEq(kind, true);
+  } else if (q === 'voice') {
+    rebuildAudioChain(kind);
+  }
+}
+
+const chainBuildSeq = {}; // kind -> 重建序号（防止重建竞态：旧重建结果作废）
+
+// 重建处理链（语音档重采样/切换档位时），推流 track 热替换（无需重新弹窗）
+async function rebuildAudioChain(kind) {
+  const raw = audioTracks[kind];
+  const pc = audioPubPCs[kind];
+  if (!raw || !pc) return;
+  const seq = (chainBuildSeq[kind] = (chainBuildSeq[kind] || 0) + 1);
+  if (audioChains[kind]) {
+    cancelAnimationFrame(audioChains[kind].raf);
+    audioChains[kind].ctx.close().catch(() => {});
+    delete audioChains[kind];
+  }
+  if (sendAgcTimer[kind]) { clearInterval(sendAgcTimer[kind]); delete sendAgcTimer[kind]; }
+  const rawStream = new MediaStream([raw]);
+  const sr = audioSettings[kind].quality === 'voice' ? 32000 : undefined;
+  const chain = buildAudioChain(kind, rawStream, sr);
+  if (chainBuildSeq[kind] !== seq) { chain.ctx.close().catch(() => {}); return; } // 已被更新重建，作废
+  audioChains[kind] = chain;
+  setSendVol(kind, audioSettings[kind].volume);
+  applySendTopology(kind, audioSettings[kind].quality === 'standard');
+  if (audioSettings[kind].quality === 'standard' && audioSettings[kind].eq) setSendEq(kind, true);
+  drawSendWave(kind);
+  const newTrack = chain.dest.stream.getAudioTracks()[0];
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'audio');
+  if (sender) sender.replaceTrack(newTrack).catch(() => {});
+}
+
+async function loadMicSources() {
+  const sel = document.getElementById('micSrc');
+  if (!sel || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const mics = devices.filter(d => d.kind === 'audioinput' && d.deviceId);
+    const existing = new Set(Array.from(sel.options).map(o => o.value));
+    mics.forEach(m => {
+      if (!existing.has(m.deviceId)) {
+        const opt = document.createElement('option');
+        opt.value = m.deviceId;
+        opt.textContent = m.label ? m.label : '麦克风（未授权，共享后显示）';
+        sel.appendChild(opt);
+      }
+    });
+  } catch (e) {}
+}
+
+// 摄像头设备列表（同麦克风模式：授权后标签可见）
+async function loadCamSources() {
+  const sel = document.getElementById('camSrc');
+  if (!sel || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter(d => d.kind === 'videoinput' && d.deviceId);
+    const existing = new Set(Array.from(sel.options).map(o => o.value));
+    cams.forEach(c => {
+      if (!existing.has(c.deviceId)) {
+        const opt = document.createElement('option');
+        opt.value = c.deviceId;
+        opt.textContent = c.label ? c.label : '摄像头（未授权，共享后显示）';
+        sel.appendChild(opt);
+      }
+    });
+  } catch (e) {}
+}
+
+async function toggleAudioShare(kind) {
+  if (audioPubPCs[kind]) { stopAudioShare(kind); return; }
+  const btn = document.getElementById(kind === 'mic' ? 'btnMic' : 'btnSys');
+  const state = document.getElementById(kind === 'mic' ? 'micState' : 'sysState');
+  let rawStream;
+  try {
+    if (kind === 'system') {
+      // 仅允许共享标签页音频（弹窗请选择【标签页】并勾选【分享标签页音频】；
+      // 窗口/屏幕的系统混合音为全系统回环，会产生回声或听到自己麦克风的声音，已禁用）
+      state.textContent = '弹窗中：选择【标签页】，勾选【分享标签页音频】';
+      const ds = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      const surf = ds.getVideoTracks()[0] ? ds.getVideoTracks()[0].getSettings().displaySurface : '';
+      ds.getVideoTracks().forEach(t => t.stop());
+      if (surf && surf !== 'browser') {
+        state.textContent = '仅允许共享标签页音频：窗口/屏幕音频为系统混合音，会产生回声或听到自己麦克风的声音（请重新选择标签页）';
+        return; // 拒绝共享
+      }
+      const at = ds.getAudioTracks()[0];
+      if (!at) { state.textContent = '未获得音频（需勾选【分享标签页音频】）'; return; }
+      rawStream = new MediaStream([at]);
+    } else {
+      const deviceId = document.getElementById('micSrc').value;
+      const denoise = audioSettings.mic.denoise;
+      // 降噪勾选（默认）= APM 三件套全开（语音友好）；取消勾选 = 原始音频（全关，音质优先）
+      const apm = denoise;
+      const audioOpts = {
+        noiseSuppression: apm,
+        echoCancellation: apm,
+        autoGainControl: apm,
+        sampleRate: { ideal: 48000 },
+        sampleSize: { ideal: 16 },
+        channelCount: { ideal: 2 },
+      };
+      if (deviceId && deviceId !== 'default') audioOpts.deviceId = { exact: deviceId };
+      rawStream = await navigator.mediaDevices.getUserMedia({ audio: audioOpts });
+    }
+  } catch (e) {
+    state.textContent = kind === 'mic' ? '麦克风获取失败' : '未获得系统音频';
+    return;
+  }
+  audioTracks[kind] = rawStream.getAudioTracks()[0];
+  audioTracks[kind].onended = () => stopAudioShare(kind); // 浏览器原生停止共享（标签页音频）时自动复位
+  // Web Audio 处理链：无损默认（仅降噪+增益）；标准档接入智能均衡+软膝
+  const chain = buildAudioChain(kind, rawStream, audioSettings[kind].quality === 'voice' ? 32000 : undefined);
+  audioChains[kind] = chain;
+  setSendVol(kind, audioSettings[kind].volume);
+  applySendTopology(kind, audioSettings[kind].quality === 'standard');
+  if (audioSettings[kind].quality === 'standard' && audioSettings[kind].eq) setSendEq(kind, true);
+  drawSendWave(kind);
+  const stream = chain.dest.stream; // 推流处理后的流
+  const pc = new RTCPeerConnection({ iceServers });
+  pc.onicecandidate = e => {
+    if (e.candidate) send({ type: 'candidate', pc: 'audio-' + kind, candidate: e.candidate.toJSON() });
+  };
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) stopAudioShare(kind);
+  };
+  pc.addTrack(stream.getAudioTracks()[0], stream);
+  audioPubPCs[kind] = pc;
+  try {
+    const offer = await pc.createOffer();
+    // 开启立体声与高码率（opus：stereo + maxaveragebitrate 520k；音乐/视频共享音质提升，语音无副作用）
+    if (offer.sdp.includes('useinbandfec=1')) {
+      offer.sdp = offer.sdp.replace(/useinbandfec=1/g, 'useinbandfec=1;stereo=1;maxaveragebitrate=510000');
+    }
+    await pc.setLocalDescription(offer);
+    send({ type: 'publish-offer', pc: 'audio-' + kind, sdp: pc.localDescription.toJSON() });
+  } catch (e) { stopAudioShare(kind); return; }
+  btn.innerHTML = ICON_STOP; // 共享中：停止图标
+  btn.classList.add('iconbtn', 'active');
+  btn.classList.remove('idle');
+  state.textContent = kind === 'system' ? '音频共享中' : '麦克风共享中';
+  if (kind === 'mic') loadMicSources();
+}
+
+function stopAudioShare(kind) {
+  if (audioPubPCs[kind]) { audioPubPCs[kind].close(); delete audioPubPCs[kind]; }
+  if (audioTracks[kind]) { audioTracks[kind].onended = null; audioTracks[kind].stop(); delete audioTracks[kind]; }
+  if (audioChains[kind]) {
+    cancelAnimationFrame(audioChains[kind].raf);
+    audioChains[kind].ctx.close().catch(() => {});
+    delete audioChains[kind];
+  }
+  if (sendAgcTimer[kind]) { clearInterval(sendAgcTimer[kind]); delete sendAgcTimer[kind]; }
+  const btn = document.getElementById(kind === 'mic' ? 'btnMic' : 'btnSys');
+  const state = document.getElementById(kind === 'mic' ? 'micState' : 'sysState');
+  if (btn) { btn.innerHTML = kind === 'mic' ? ICON_MIC : ICON_MUSIC; btn.classList.add('idle'); btn.classList.remove('active'); }
+  if (state) state.textContent = kind === 'mic' ? '麦克风未共享' : '音频未共享';
+}
+
+// 发送端编码参数：分辨率通过 scaleResolutionDownBy 动态降采样（无需重新采集/弹窗）
+function updateSenderParams() {
+  if (!pubPC || !myStream) return;
+  const sender = videoSenderOf();
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (params.encodings && params.encodings.length) {
+      // 保帧率：带宽/编码压力不足时降分辨率而非降帧率（避免 4K 被压到 30fps）
+      params.degradationPreference = 'maintain-framerate';
+      // 基于实际采集分辨率计算目标缩放（采集固定为屏幕最大分辨率）
+      const st = myTrack.getSettings();
+      const baseW = st.width || sharerCfg.width;
+      const scaleH = Math.max(1, baseW / sharerCfg.width); // 目标分辨率对应的 h 层缩放（支持小数）
+      for (const enc of params.encodings) {
+        enc.maxFramerate = sharerCfg.frameRate; // 各层统一帧率
+        if (enc.rid === 'h' || !enc.rid) { // 无 rid（单层 h264 降级）视为 h 层
+          enc.scaleResolutionDownBy = scaleH;
+          enc.maxBitrate = isIOS ? 1_500_000 : sharerCfg.bitrate; // iOS 单层固定低码率（H.264 缺陷规避）
+        } else if (enc.rid === 'm') {
+          enc.maxBitrate = 4_000_000;
+          enc.scaleResolutionDownBy = Math.max(1, scaleH * 2);
+        } else if (enc.rid === 'l') {
+          enc.maxBitrate = 500_000;
+          enc.scaleResolutionDownBy = Math.max(1, scaleH * 4);
+        }
+      }
+      return sender.setParameters(params);
+    }
+  } catch (e) {}
+  return Promise.reject(new Error('setParameters 不可用'));
+}
+
+async function getCaptureStream() {
+  return navigator.mediaDevices.getDisplayMedia({
+    video: {
+      // 采集固定为屏幕最大分辨率（4K），分辨率目标通过编码端 scaleResolutionDownBy 实现
+      width: { ideal: 3840, max: 3840 },
+      height: { ideal: 2160, max: 2160 },
+      frameRate: { ideal: sharerCfg.frameRate, max: sharerCfg.frameRate },
+    },
+    // 音频独立（单独"共享音频"按钮），不与屏幕共享捆绑
+  });
+}
+
+function videoSenderOf() {
+  if (!pubPC) return null;
+  return pubPC.getSenders().find(s => s.track && s.track.kind === 'video') || null;
+}
+
+async function startShare() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    $('myStats').textContent = '证书未受信或浏览器限制：请按盾牌按钮安装 CA 后完全关闭浏览器重开';
+    return;
+  }
+  if (myStream) { restartCapture(); return; } // 已共享：切换目标
+  let stream;
+  try { stream = await getCaptureStream(); } catch (e) {
+    $('myStats').textContent = '未获得屏幕采集（证书未受信或用户取消）：请按盾牌按钮安装 CA 后完全关闭浏览器重开';
+    return;
+  }
+  setupPublish(stream);
+}
+
+// ---- 聊天（文本 + 图片/文件，服务器广播，新成员可见历史） ----
+
+let chatUnread = 0; // 聊天未读计数（面板关闭时收到新消息累加，打开清零）
+
+function updateChatBadge() {
+  const b = $('chatBadge');
+  if (chatUnread > 0) {
+    b.textContent = chatUnread > 99 ? '99+' : chatUnread;
+    b.hidden = false;
+  } else {
+    b.hidden = true;
+  }
+}
+
+// 状态栏提示（6 秒自动清除；清除后恢复连接状态，避免覆盖"已连接"后留下空白）
+function flashMsg(txt) {
+  const el = $('netState');
+  if (el) {
+    el.textContent = txt;
+    el.classList.add('warn');
+    clearTimeout(flashMsg._t);
+    flashMsg._t = setTimeout(() => {
+      el.textContent = (ws && ws.readyState === WebSocket.OPEN) ? '已连接' : '连接中…';
+      el.classList.remove('warn');
+    }, 6000);
+  }
+}
+
+async function sendChatText() {
+  await sendPasteQueue(); // 先发送候选区文件，再发送文本
+  let text = $('chatInput').value.trim();
+  if (!text) return;
+  if (text.length > 2000) text = text.slice(0, 2000); // 输入上限 2000（发送前截断兜底，与服务器一致）
+  send({ type: 'chat', text });
+  $('chatInput').value = '';
+  $('chatInput').style.height = ''; // 发送后恢复单行
+  $('chatCharCount').textContent = '0/2000';
+  $('chatCharCount').classList.remove('over');
+}
+
+// 渲染粘贴候选区（图片缩略图 / 文件图标 + 名 + 大小，可单独移除）
+function renderPasteQueue() {
+  const q = $('chatPasteQueue');
+  if (!q) return;
+  if (!pasteQueue.length) { q.hidden = true; q.innerHTML = ''; return; }
+  q.hidden = false;
+  q.innerHTML = pasteQueue.map((it, i) => {
+    const f = it.file;
+    let thumb;
+    if (f.type.startsWith('image/')) {
+      if (!it.url) it.url = URL.createObjectURL(f);
+      thumb = `<img src="${it.url}" alt="">`;
+    } else {
+      thumb = `<span class="pIcon">${ICON_FILE}</span>`;
+    }
+    const size = f.size >= 1048576 ? (f.size / 1048576).toFixed(1) + 'MB' : Math.max(1, Math.round(f.size / 1024)) + 'KB';
+    return `<div class="pasteItem">${thumb}<div class="pInfo"><div class="pName">${escapeHtml(f.name || 'image')}</div><div class="pSize">${size}</div></div>
+      <button class="pDel" data-i="${i}" title="移除">×</button></div>`;
+  }).join('');
+  q.querySelectorAll('.pDel').forEach(b => {
+    b.onclick = () => {
+      const it = pasteQueue[Number(b.dataset.i)];
+      if (it && it.url) URL.revokeObjectURL(it.url);
+      pasteQueue.splice(Number(b.dataset.i), 1);
+      renderPasteQueue();
+    };
+  });
+}
+
+// 发送粘贴候选（逐条上传发送，先清空候选区）
+async function sendPasteQueue() {
+  if (!pasteQueue.length) return;
+  const items = pasteQueue;
+  pasteQueue = [];
+  renderPasteQueue();
+  for (const it of items) {
+    if (it.url) URL.revokeObjectURL(it.url);
+    await sendChatFile(it.file);
+  }
+}
+
+// 更新聊天记录计数（n/100，上限提示）
+function updateChatCount() {
+  const n = $('chatList').children.length;
+  $('chatHint').textContent = `聊天记录上限 100 条（当前 ${n}/100），服务器重启后清空；文件缓存上限 200MB，超限时新文件会清理最旧文件；大文件 60 分钟后可能过期`;
+}
+
+async function sendChatFile(file) {
+  if (!file) return;
+  if (file.size > 100 * 1024 * 1024) { $('netState').textContent = '文件超过 100MB 限制'; return; }
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/chat-file', { method: 'POST', body: fd });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || !j.id) { $('netState').textContent = '文件上传失败'; return; }
+    send({ type: 'chat', fileId: j.id, fileName: j.name || file.name, fileType: j.mime || file.type });
+  } catch (e) {
+    $('netState').textContent = '文件上传失败';
+  }
+}
+
+function chatTimeStr(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 聊天文本链接高亮（escapeHtml 后替换，避免注入）
+function linkify(text) {
+  return escapeHtml(text).replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1" target="_blank" rel="noopener">$1</a>');
+}
+
+// OG 链接预览卡片（自动：消息含链接时取第一个请求预览；加载中占位 → 成功替换/失败移除）
+function previewLink(url, bodyEl) {
+  const ph = document.createElement('div');
+  ph.className = 'chatExpired';
+  ph.textContent = '正在解析链接…';
+  bodyEl.appendChild(ph);
+  fetch('/api/link-preview?url=' + encodeURIComponent(url))
+    .then(r => r.json())
+    .then(j => {
+      ph.remove();
+      if (!j || (!j.title && !j.desc && !j.image)) return;
+      const html = `<a class="linkCard" href="${escapeHtml(url)}" target="_blank" rel="noopener">
+        ${j.image ? `<img src="${escapeHtml(j.image)}" referrerpolicy="no-referrer" onerror="this.remove()">` : ''}
+        <div class="linkCardBody">
+          ${j.title ? `<div class="linkTitle">${escapeHtml(j.title)}</div>` : ''}
+          ${j.desc ? `<div class="linkDesc">${escapeHtml(j.desc)}</div>` : ''}
+        </div>
+      </a>`;
+      bodyEl.insertAdjacentHTML('beforeend', html);
+    })
+    .catch(() => { ph.remove(); });
+}
+
+function appendChatMsg(m, skipUnread) {
+  const list = $('chatList');
+  const el = document.createElement('div');
+  el.className = 'chatMsg';
+  const body = [];
+  if (m.text) body.push(`<div class="chatText">${linkify(m.text)}</div>`);
+  if (m.fileId) {
+    const isImg = /^image\//.test(m.fileType || '');
+    const isVideo = /^video\//.test(m.fileType || '');
+    if (isImg) {
+      // 图片：加载失败（文件已过期/被清理）→ 显示过期占位
+      body.push(`<img class="chatImg" src="/api/chat-file/${m.fileId}" alt="图片" onclick="window.open('/api/chat-file/${m.fileId}','_blank')" onerror="this.outerHTML='<span class=\'chatExpired\'>（图片已过期）</span>'">`);
+    } else if (isVideo) {
+      // 视频：内联播放（服务器对 video/* 返回 inline）；加载失败 → 过期占位
+      body.push(`<video class="chatVideo" src="/api/chat-file/${m.fileId}" controls preload="metadata" onerror="this.outerHTML='<span class=\'chatExpired\'>（视频已过期）</span>'"></video>`);
+    } else {
+      // 文件：异步检测是否仍可用，404 → 过期占位
+      const key = 'f' + m.fileId + '-' + (m.ts || Math.random());
+      body.push(`<a class="chatFile" id="${key}" href="/api/chat-file/${m.fileId}" download="${escapeHtml(m.fileName || 'file')}">${ICON_FILE} ${escapeHtml(m.fileName || '文件')}</a>`);
+      setTimeout(() => {
+        const a = document.getElementById(key);
+        if (!a) return;
+        fetch('/api/chat-file/' + m.fileId, { method: 'HEAD' })
+          .then(r => { if (!r.ok && a) a.outerHTML = '<span class="chatExpired">（文件已过期）</span>'; })
+          .catch(() => { if (a) a.outerHTML = '<span class="chatExpired">（文件已过期）</span>'; });
+      }, 50);
+    }
+  }
+  el.innerHTML = `
+    <span class="dot" style="background:${m.color || '#9fb3d1'}"></span>
+    <div class="chatBody">
+      <div class="chatMeta"><b>${escapeHtml(m.fromName || m.from || '')}</b><span class="chatTime">${chatTimeStr(m.ts)}</span></div>
+      ${body.join('')}
+    </div>`;
+  el.dataset.ts = m.ts || '';
+  // 按 ts 有序插入（跨节点合并历史可能时间乱序——追加式显示会乱，改为按时间定位插入）
+  const ms = Number(el.dataset.ts) || 0;
+  let inserted = false;
+  const children = list.children;
+  for (let i = children.length - 1; i >= 0; i--) {
+    const t = Number(children[i].dataset.ts || 0);
+    if (t <= ms) {
+      list.insertBefore(el, children[i].nextSibling);
+      inserted = true;
+      break;
+    }
+  }
+  if (!inserted) list.appendChild(el);
+  // 自动链接预览（第一个 URL）
+  if (m.text) {
+    const urlMatch = m.text.match(/https?:\/\/[^\s<>"']+/);
+    if (urlMatch) {
+      const bodyEl = el.querySelector('.chatBody');
+      previewLink(urlMatch[0], bodyEl);
+    }
+  }
+  list.scrollTop = list.scrollHeight;
+  // 未读计数：面板关闭时收到新消息累加（自己发送的消息与历史不计）
+  if (!skipUnread && $('chatPanel').hidden && m.from !== myId) {
+    chatUnread++;
+    updateChatBadge();
+  }
+  updateChatCount();
+}
+
+function handleChatHistory(m) {
+  (m.messages || []).forEach(msg => appendChatMsg(msg, true)); // 历史不计未读
+}
+
+// ---- 编解码器选择（H.264 优先 + 自动回退 VP8 + 手动切换） ----
+let codecMode = 'auto'; // 'auto' | 'h264' | 'vp8'（屏幕与摄像头共用）
+let camRestarting = false, camRestartFail = false; // 摄像头热切换标志（失败不清理状态，自动回滚）
+
+// 按模式返回 codec 偏好（getCapabilities 检测；H.264 优先硬件编码，性能优先）
+// pcType: 'publish'=屏幕共享（codecMode 可切换）；'camera'=摄像头（固定 VP8，兼容最广且规避 iOS H.264 推流缺陷）
+function pickCodecPrefs(pcType) {
+  const caps = RTCRtpSender.getCapabilities('video');
+  if (!caps) return null;
+  const h264 = caps.codecs.find(c => c.mimeType === 'video/H264');
+  const vp8 = caps.codecs.find(c => c.mimeType === 'video/VP8');
+  if (pcType === 'camera') return vp8 ? [vp8] : null; // 摄像头固定 VP8
+  if (isIOS) return vp8 ? [vp8] : null; // iOS Safari H.264 推流缺陷：屏幕共享也强制回退 VP8
+  if (codecMode === 'vp8') return vp8 ? [vp8] : null;
+  if (h264) return [h264]; // auto/h264：优先 H.264（无 h264 环境由浏览器默认回退）
+  return vp8 ? [vp8] : null;
+}
+
+// 发送编码层（H.264/VP8 均尝试三档 simulcast；H.264 硬件不支持时浏览器自动降级，观看端单层回退已兼容）
+function sendEncodingsFor(cfg) {
+  if (isIOS) {
+    return [{ maxBitrate: 1_500_000, maxFramerate: Math.min(cfg.frameRate, 30) }];
+  }
+  return [
+    { rid: 'l', maxBitrate: 500_000, scaleResolutionDownBy: 4.0 },
+    { rid: 'm', maxBitrate: 4_000_000, scaleResolutionDownBy: 2.0 },
+    { rid: 'h', maxBitrate: cfg.bitrate, maxFramerate: cfg.frameRate },
+  ];
+}
+
+// 创建推流 pc（屏幕/摄像头共用）：codec 偏好 + 三档编码 + candidate/状态回调 + offer 发送
+function createPublishPC(track, cfg, pcType) {
+  const pc = new RTCPeerConnection({ iceServers });
+  pc.onicecandidate = e => {
+    if (e.candidate) send({ type: 'candidate', pc: pcType, candidate: e.candidate.toJSON() });
+  };
+  if (pcType === 'publish') {
+    pc.onconnectionstatechange = () => {
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+        closePublish();
+        $('myStats').textContent = '推流连接中断';
+      }
+    };
+  } else {
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected' && camRestarting) camRestarting = false;
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+        if (camRestarting) { camRestartFail = true; return; } // 热切换失败：不清理状态，交由切换流程回滚
+        stopCameraShare();
+      }
+    };
+  }
+  const transceiver = pc.addTransceiver(track, {
+    direction: 'sendonly',
+    sendEncodings: sendEncodingsFor(cfg),
+  });
+  try {
+    const prefs = pickCodecPrefs(pcType);
+    if (prefs) transceiver.setCodecPreferences(prefs);
+  } catch (e) {}
+  pc.createOffer().then(offer => {
+    pc.setLocalDescription(offer).then(() => {
+      send({ type: 'publish-offer', pc: pcType, sdp: pc.localDescription.toJSON() });
+    });
+  }).catch(() => {});
+  return pc;
+}
+
+// 摄像头编码器热切换（共享中）：复用采集流重建推流连接（画面短暂重连，无需重新弹窗）
+async function restartCamPublish() {
+  if (!camPC || !camTrack) return;
+  camRestarting = true;
+  camRestartFail = false;
+  if (camPC) {
+    camPC.onconnectionstatechange = null; // 防旧 pc 关闭触发 stopCameraShare 清理新状态
+    camPC.close();
+    camPC = null;
+  }
+  camPC = createPublishPC(camTrack, camCfg, 'camera');
+  $('camState').textContent = '摄像头共享中';
+  setTimeout(() => { camRestarting = false; }, 8000); // 连接观察期兜底
+}
+
+function setupPublish(stream) {
+  myStream = stream;
+  myTrack = stream.getVideoTracks()[0];
+  myTrack.onended = () => {
+    stopShare();
+    sndShareStop();
+    flashMsg('屏幕共享已意外停止（窗口被关闭或系统限制），可重新开启');
+  };
+  $('myVideo').srcObject = stream;
+  $('myVideo').hidden = false;
+  $('myPill').textContent = '屏幕共享中';
+  $('myPill').className = 'pill on';
+  $('btnStart').innerHTML = ICON_STOP; // 共享中：停止图标
+  $('btnStart').classList.remove('idle');
+  $('btnStart').classList.add('active'); // 共享中：白色
+  $('btnSwitch').hidden = false; // 切换目标：共享时显示
+
+  const invBtn = document.getElementById('btnInviteCtl');
+  if (invBtn) invBtn.hidden = false; // host 共享屏幕中：显示邀请按钮
+
+  pubPC = createPublishPC(myTrack, sharerCfg, 'publish');
+  // 初始编码参数立即应用（degradationPreference=maintain-framerate 保帧率等）
+  updateSenderParams().catch(() => {});
+  sendShareConfig();
+  $('myStats').textContent = '推流中…';
+}
+
+async function restartCapture() {
+  const oldTrack = myTrack;
+  let stream;
+  try { stream = await getCaptureStream(); } catch (e) { return; }
+  myStream = stream;
+  myTrack = stream.getVideoTracks()[0];
+  myTrack.onended = () => stopShare();
+  $('myVideo').srcObject = stream;
+  if (pubPC) {
+    const sender = videoSenderOf();
+    if (sender) sender.replaceTrack(myTrack).catch(() => {});
+  }
+  if (oldTrack) { oldTrack.onended = null; oldTrack.stop(); }
+  updateSenderParams().catch(() => {}); // 新采集分辨率下重算编码缩放
+  sendShareConfig();
+  $('myStats').textContent = '已切换采集目标';
+}
+
+function closePublish() {
+  if (pubPC) { pubPC.close(); pubPC = null; }
+  if (myStream) {
+    myStream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+  }
+  myStream = null; myTrack = null;
+  $('myVideo').srcObject = null;
+  $('myVideo').hidden = true;
+  $('myPill').textContent = '屏幕未共享';
+  $('myPill').className = 'pill';
+  $('btnStart').innerHTML = ICON_MONITOR; // 未共享：显示器图标
+  $('btnStart').classList.remove('active');
+  $('btnStart').classList.add('idle'); // 未共享：灰色
+  $('btnSwitch').hidden = true;
+  const invBtn = document.getElementById('btnInviteCtl');
+  if (invBtn) invBtn.hidden = true; // 停止共享：隐藏邀请按钮
+}
+
+function stopShare() {
+  send({ type: 'share-stop' });
+  closePublish();
+  $('myStats').textContent = '已停止共享';
+}
+
+// ---------- 摄像头共享（独立流，流 id = ownerId-cam，与屏幕/音频并存） ----------
+let camPC = null, camStream = null, camTrack = null;
+const camCfg = { width: 1280, height: 720, frameRate: 30, bitrate: 2000000 }; // 摄像头独立清晰度/帧率/码率
+
+// 摄像头编码参数实时调整（共享中修改即时生效）
+function updateCamParams() {
+  if (!camPC || !camTrack) return;
+  const sender = camPC.getSenders().find(s => s.track && s.track.kind === 'video');
+  if (!sender) return;
+  try {
+    const params = sender.getParameters();
+    if (params.encodings && params.encodings.length) {
+      const st = camTrack.getSettings();
+      const baseW = st.width || camCfg.width;
+      const scaleH = Math.max(1, baseW / camCfg.width);
+      for (const enc of params.encodings) {
+        enc.maxFramerate = camCfg.frameRate;
+        if (enc.rid === 'h' || !enc.rid) { // 无 rid（单层 h264 降级）视为 h 层
+          enc.maxBitrate = camCfg.bitrate;
+          enc.scaleResolutionDownBy = scaleH;
+        } else if (enc.rid === 'm') {
+          enc.maxBitrate = 4_000_000;
+          enc.scaleResolutionDownBy = Math.max(1, scaleH * 2);
+        } else if (enc.rid === 'l') {
+          enc.maxBitrate = 300_000;
+          enc.scaleResolutionDownBy = Math.max(1, scaleH * 4);
+        }
+      }
+      return sender.setParameters(params);
+    }
+  } catch (e) {
+    console.warn('[cam] setParameters 失败:', e);
+  }
+  return Promise.reject(new Error('setParameters 不可用'));
+}
+
+async function toggleCameraShare() {
+  if (camPC) { stopCameraShare(); return; }
+  const state = $('camState');
+  let stream;
+  try {
+    const deviceId = $('camSrc').value;
+    const videoOpts = {
+      width: { ideal: camCfg.width },
+      height: { ideal: camCfg.height },
+      frameRate: { ideal: camCfg.frameRate },
+    };
+    if (deviceId && deviceId !== 'default') videoOpts.deviceId = { exact: deviceId };
+    stream = await navigator.mediaDevices.getUserMedia({ video: videoOpts });
+  } catch (e) { state.textContent = '摄像头获取失败'; return; }
+  camStream = stream;
+  camTrack = stream.getVideoTracks()[0];
+  camTrack.onended = () => {
+    stopCameraShare();
+    sndShareStop();
+    flashMsg('摄像头已意外停止（设备被占用或页面进入后台），请重新开启');
+  };
+  const st0 = camTrack.getSettings();
+  $('camActual').textContent = `实际采集：${st0.width || '?'}×${st0.height || '?'} @ ${st0.frameRate || '?'}fps（受摄像头硬件限制，目标 ${camCfg.width}×${camCfg.height}）`;
+  $('myCamVideo').srcObject = stream;
+  $('myCamVideo').hidden = false;
+  camPC = createPublishPC(camTrack, camCfg, 'camera');
+  $('btnCam').innerHTML = ICON_STOP; // 共享中：停止图标
+  $('btnCam').classList.remove('idle');
+  $('btnCam').classList.add('active');
+  state.textContent = '摄像头共享中';
+  loadCamSources(); // 授权后摄像头标签可见
+}
+
+function stopCameraShare() {
+  if (camPC) { camPC.close(); camPC = null; }
+  if (camStream) { camStream.getTracks().forEach(t => { t.onended = null; t.stop(); }); }
+  camStream = null; camTrack = null;
+  $('myCamVideo').srcObject = null;
+  $('myCamVideo').hidden = true;
+  const btn = $('btnCam');
+  if (btn) { btn.innerHTML = ICON_CAM; btn.classList.add('idle'); btn.classList.remove('active'); }
+  const state = $('camState');
+  if (state) state.textContent = '摄像头未共享';
+  const actual = $('camActual');
+  if (actual) actual.textContent = '实际采集：—';
+}
+
+/* ---------- 用户卡片 ---------- */
+
+// 视频流（ownerID 或 ownerID-cam）的卡片 video 元素（观看方式/全屏/PiP 用）
+function videoOfStream(streamId) {
+  if (streamId.endsWith('-cam')) {
+    const ownerId = streamId.slice(0, -4);
+    const el = document.getElementById('card-' + ownerId);
+    return el ? el.querySelector('[data-cam]') : null;
+  }
+  const el = document.getElementById('card-' + streamId);
+  return el ? el.querySelector('video') : null;
+}
+
+function isMobile() {
+  return navigator.maxTouchPoints > 1 || /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+}
+
+const ICON_CINEMA = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>';
+const ICON_FULLSCREEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M20 8V6a2 2 0 0 0-2-2h-2"/><path d="M4 16v2a2 2 0 0 0 2 2h2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/></svg>';
+const ICON_PIP = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><rect x="12" y="10" width="7" height="5" rx="1"/></svg>';
+const ICON_VOLUME = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>';
+const ICON_MUTED = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>';
+const ICON_STOP = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="5" y="5" width="14" height="14" rx="2"/></svg>';
+const ICON_CAM = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg>';
+const ICON_MONITOR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>';
+const ICON_MONITOR_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="16" height="12" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="15" x2="12" y2="21"/><circle cx="19" cy="19" r="2.6"/><circle cx="19" cy="19" r="1"/></svg>';
+const ICON_USER_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="8" r="4"/><path d="M4 21v-2a6 6 0 0 1 12 0v2"/><circle cx="19" cy="19" r="2.6"/><circle cx="19" cy="19" r="1"/></svg>';
+const ICON_NET = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="7" height="7" rx="1.5"/><rect x="15" y="10" width="7" height="7" rx="1.5"/><path d="M5.5 14v3a2 2 0 0 0 2 2h5.5"/><path d="M18.5 10V8a2 2 0 0 0-2-2H10"/></svg>';
+const ICON_QUALITY_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><circle cx="21" cy="21" r="2.2"/><circle cx="21" cy="21" r="0.8"/></svg>';
+const ICON_SHARE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>';
+const ICON_SHIELD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
+const ICON_MIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/></svg>';
+const ICON_MUSIC = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+const ICON_MIC_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/><circle cx="19" cy="19" r="2.6"/><circle cx="19" cy="19" r="1"/></svg>';
+const ICON_CAM_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/><circle cx="20" cy="19" r="2.6"/><circle cx="20" cy="19" r="1"/></svg>';
+const ICON_MUSIC_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/><circle cx="20" cy="20" r="2.6"/><circle cx="20" cy="20" r="1"/></svg>';
+const ICON_CTL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l7.07 16.97 2.51-7.39 7.39-2.51L3 3z"/><path d="M13 13l6 6"/></svg>';
+const ICON_TERMINAL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
+const ICON_INFO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>';
+const ICON_CHAT = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>';
+const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+const ICON_ARROW_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
+
+// 控制条 HTML（画质下拉 + 三个观看方式图标；音量控制不在画面上，位于卡片下方）
+function controlsHTML(streamId) {
+  const pipBtn = document.pictureInPictureEnabled && !isMobile()
+    ? `<button class="ctrl" data-watch="pip" data-stream="${streamId}" title="画中画">${ICON_PIP}</button>` : '';
+  return `<div class="controls">
+    <select class="tierSel" data-stream="${streamId}" title="画质">
+      <option value="l">流畅</option><option value="m">高清</option><option value="h">超清</option>
+    </select>
+    <button class="ctrl ctlBtn" data-ctl="${streamId}" title="远程控制（需对方同意；仅支持控制服务器运行者的屏幕）">${ICON_CTL}</button>
+    <button class="ctrl" data-watch="cinema" data-stream="${streamId}" title="网页全屏">${ICON_CINEMA}</button>
+    <button class="ctrl" data-watch="fullscreen" data-stream="${streamId}" title="全屏">${ICON_FULLSCREEN}</button>
+    ${pipBtn}
+  </div>`;
+}
+
+// ---- 远程控制（P2-2）：控制端 / 被控端 消息处理 ----
+
+function handleCtrlMsg(m) {
+  switch (m.action) {
+    case 'request': // 被控端收到控制请求
+      ctrlPendingReq = { controller: m.controller, controllerName: m.controllerName || '', mode: 'request' };
+      sndCtrlReq();
+      $('ctrlReqText').textContent = `${escapeHtml(m.controllerName || m.controller)} 请求控制你的屏幕，是否同意？`;
+      $('ctrlReqModal').hidden = false;
+      break;
+    case 'invite-received': // 被邀请者收到控制邀请
+      ctrlPendingReq = { controller: m.controller, controllerName: m.controllerName || '', mode: 'invite' };
+      sndInvite();
+      $('ctrlReqText').textContent = `${escapeHtml(m.controllerName || m.controller)} 邀请你控制其屏幕，是否接受？`;
+      $('ctrlReqModal').hidden = false;
+      break;
+    case 'invite-declined': // 被控端：邀请被拒绝
+      flashMsg('对方拒绝了你的控制邀请');
+      break;
+    case 'invite-failed': // 被控端：邀请校验失败
+      flashMsg('邀请失败：' + (m.reason || '未知原因'));
+      break;
+    case 'request-result': // 控制端：请求结果
+      if (!m.ok) flashMsg('控制请求被拒：' + (m.reason || '未知原因'));
+      break;
+    case 'granted': // 控制端：获得控制权
+      ctrlView = { target: m.target, active: true };
+      sndCtrlState();
+      flashMsg('已获得远程控制权（点击画面操作，松开可释放）');
+      applyCtlLayer();
+      break;
+    case 'denied':
+      flashMsg('控制请求被拒绝');
+      break;
+    case 'revoked': // 控制端：被收回
+      ctrlView = null;
+      sndCtrlState();
+      applyCtlLayer();
+      flashMsg('控制权已被收回');
+      break;
+    case 'controlled': // 被控端：正在被控制
+      ctrlHost = { controller: m.controller, controllerName: m.controllerName || '' };
+      $('ctrlBannerText').textContent = `正在被 ${escapeHtml(m.controllerName || m.controller)} 远程控制`;
+      $('ctrlBanner').hidden = false;
+      break;
+    case 'released': // 被控端：控制者已释放/断开
+      ctrlHost = null;
+      $('ctrlBanner').hidden = true;
+      break;
+    case 'request-cancel':
+      ctrlPendingReq = null;
+      $('ctrlReqModal').hidden = true;
+      break;
+  }
+}
+
+// 申请/切换确认模态（替代浏览器 confirm）：标题/文案/确认按钮文字/确认回调
+let ctrlApplyCb = null;
+function openCtrlApply(title, text, okLabel, cb) {
+  ctrlApplyCb = cb;
+  $('ctrlApplyTitle').textContent = title;
+  $('ctrlApplyText').textContent = text;
+  $('ctrlApplyOk').textContent = okLabel;
+  $('ctrlApplyModal').hidden = false;
+}
+function closeCtrlApply() {
+  ctrlApplyCb = null;
+  $('ctrlApplyModal').hidden = true;
+}
+
+// 控制端：请求控制（streamId 为卡片流 id：ownerId 或 ownerId-cam）
+function requestCtrl(streamId) {
+  if (ctrlView && ctrlView.active) { releaseCtrl(); return; } // 已在控制：点击切换为释放
+  const ownerId = streamOwners.get(streamId) || streamId;
+  if (ownerId === myId) { flashMsg('不能控制自己'); return; }
+  // 远端主机流（owner id 含冒号=节点前缀）：输入在目标主机服务器执行，需先切换到该主机才能控制
+  if (ownerId.includes(':')) {
+    const node = ownerId.split(':')[0];
+    const n = netNodes.find(x => x.id === node);
+    const addr = n && n.remote ? (n.remote.startsWith('http') ? n.remote.replace(/^https?:\/\//, '') : n.remote) : '';
+    if (addr) {
+      openCtrlApply('切换到该主机',
+        `该屏幕属于互联主机 ${node}（${addr}），远程控制需切换到该主机后发起。\n\n是否在新标签页打开该主机？`,
+        '打开该主机', () => window.open('https://' + addr, '_blank'));
+    } else {
+      flashMsg('该屏幕属于互联主机，但未获取到其地址，无法切换');
+    }
+    return;
+  }
+  openCtrlApply('远程控制',
+    '确认申请远程控制？对方同意后你将获得鼠标/键盘控制权，可随时释放。\n\n注意：若对方共享的是副屏，鼠标操作可能无法作用于副屏画面（仅支持主屏）。',
+    '申请控制', () => {
+      send({ type: 'ctrl', action: 'request', target: ownerId });
+      flashMsg('已发送控制请求，等待对方同意…');
+    });
+}
+
+// 被控端（host）邀请对方控制：打开在线用户列表
+function openInviteModal() {
+  const list = $('ctrlInviteList');
+  const users = [...peers.values()].filter(p => p.id !== myId);
+  if (!users.length) {
+    list.innerHTML = '<p class="hint">当前没有其他在线用户</p>';
+  } else {
+    list.innerHTML = users.map(p => `
+      <div class="netItem" style="cursor:pointer" data-invite="${p.id}">
+        <span class="dot" style="background:${p.color}"></span>
+        <span>${escapeHtml(p.name)}（${p.id}）</span>
+        <span style="margin-left:auto;color:#60a5fa">邀请</span>
+      </div>`).join('');
+    list.querySelectorAll('[data-invite]').forEach(el => {
+      el.onclick = () => {
+        const pid = el.dataset.invite;
+        const p = peers.get(pid);
+        openCtrlApply('邀请对方控制',
+          `确认邀请 ${p ? escapeHtml(p.name) : pid}（${pid}）控制你的屏幕？\n\n对方同意后将获得控制权，你可随时收回。`,
+          '发送邀请', () => {
+            send({ type: 'ctrl', action: 'invite', target: pid });
+            flashMsg('已发送控制邀请，等待对方回应…');
+          });
+        $('ctrlInviteModal').hidden = true;
+      };
+    });
+  }
+  $('ctrlInviteModal').hidden = false;
+}
+
+// ---- 日志窗口：订阅服务器日志（历史 + 实时），模式切换 ----
+let logOpen = false;
+let logAcc = 0; // 当前显示行数（超限截断保留最近 500 行）
+
+function openLog() {
+  logOpen = true;
+  $('logBody').textContent = '';
+  logAcc = 0;
+  $('logModal').hidden = false;
+  send({ type: 'log-subscribe' }); // 服务器回 log-history（缓冲）+ 实时 log
+  fetch('/api/log-level').then(r => r.json()).then(j => { aboutVerbose = !!j.verbose; updateLogModeBtn(); }).catch(() => updateLogModeBtn());
+}
+
+function closeLog() {
+  logOpen = false;
+  send({ type: 'log-unsubscribe' });
+  $('logModal').hidden = true;
+  $('logBody').textContent = '';
+  logAcc = 0;
+}
+
+function updateLogModeBtn() {
+  $('logModeBtn').textContent = aboutVerbose ? '切换到正常模式' : '切换到调试模式';
+  $('logModeTxt').textContent = aboutVerbose ? '当前：调试模式（详细日志）' : '当前：正常模式';
+}
+
+function appendLogLine(line) {
+  if (!logOpen) return;
+  const b = $('logBody');
+  b.textContent += line.endsWith('\n') ? line : line + '\n';
+  logAcc++;
+  if (logAcc > 600) { // 显示上限：保留最近 500 行
+    b.textContent = b.textContent.split('\n').slice(-500).join('\n');
+    logAcc = 500;
+  }
+  b.scrollTop = b.scrollHeight; // 自动滚底
+}
+
+// ---- 提示音（Web Audio 合成，无音频文件；总开关 localStorage 'teashare_sound'，默认开） ----
+let soundCtx = null;
+function soundOn() { return localStorage.getItem('teashare_sound') !== '0'; }
+function ensureSoundCtx() {
+  if (!soundCtx) {
+    const C = window.AudioContext || window.webkitAudioContext;
+    if (C) soundCtx = new C();
+  }
+  return soundCtx;
+}
+function tone(ctx, freq, dur, delay, vol) {
+  const t0 = ctx.currentTime + (delay || 0);
+  const osc = ctx.createOscillator();
+  const g = ctx.createGain();
+  osc.type = 'sine';
+  osc.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol || 0.18, t0 + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  osc.connect(g).connect(ctx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+function playSound(steps) {
+  if (!soundOn()) return;
+  const ctx = ensureSoundCtx();
+  if (!ctx) return;
+  if (ctx.state === 'suspended') ctx.resume().catch(() => {}); // 首次用户手势后生效
+  steps.forEach(s => tone(ctx, s.f, s.d, s.w || 0, s.v));
+}
+const sndChat = () => playSound([{ f: 880, d: 0.12 }]);
+const sndCtrlReq = () => playSound([{ f: 1046, d: 0.15 }, { f: 1318, d: 0.15, w: 0.18 }]);
+const sndInvite = () => playSound([{ f: 1318, d: 0.15 }, { f: 1046, d: 0.15, w: 0.18 }]);
+const sndDisconnect = () => playSound([{ f: 440, d: 0.2 }, { f: 440, d: 0.25, w: 0.25 }]);
+const sndShareStop = () => playSound([{ f: 392, d: 0.15 }, { f: 330, d: 0.15, w: 0.16 }, { f: 262, d: 0.25, w: 0.32 }]);
+const sndStreamAdded = () => playSound([{ f: 660, d: 0.12 }, { f: 880, d: 0.15, w: 0.12 }]);
+const sndReconnect = () => playSound([{ f: 523, d: 0.12 }, { f: 784, d: 0.2, w: 0.12 }]);
+const sndCtrlState = () => playSound([{ f: 660, d: 0.15 }]);
+const sndUserJoin = () => playSound([{ f: 660, d: 0.1 }, { f: 880, d: 0.14, w: 0.1 }]);
+const sndUserLeave = () => playSound([{ f: 880, d: 0.1 }, { f: 660, d: 0.14, w: 0.1 }]);
+// 断线提示节流：重连失败循环（每 2s onclose）不重复响，30s 内只响一次
+let lastDisconnectSnd = 0;
+function sndDisconnectThrottled() {
+  const now = Date.now();
+  if (now - lastDisconnectSnd < 30000) return;
+  lastDisconnectSnd = now;
+  sndDisconnect();
+}
+// 提示音解锁：手机 Edge/iOS 自动播放策略——AudioContext 需用户手势后才 resume；
+// 首次点击/触摸页面即创建并解锁，此后事件提示音正常播放
+function unlockSound() {
+  const ctx = ensureSoundCtx();
+  if (ctx && ctx.state === 'suspended') ctx.resume().catch(() => {});
+}
+document.addEventListener('pointerdown', unlockSound);
+document.addEventListener('touchstart', unlockSound, { passive: true });
+
+function releaseCtrl() {
+  send({ type: 'ctrl', action: 'release' });
+  ctrlView = null;
+  applyCtlLayer();
+  flashMsg('已释放控制权');
+}
+
+// 被控端/被邀请者：回应请求 / 收回控制（mode 区分 申请=request / 邀请=invite）
+function respondCtrl(accept) {
+  const req = ctrlPendingReq;
+  ctrlPendingReq = null;
+  $('ctrlReqModal').hidden = true;
+  if (!req) return;
+  if (req.mode === 'invite') {
+    send({ type: 'ctrl', action: 'invite-respond', accept });
+  } else {
+    send({ type: 'ctrl', action: 'respond', target: myId, accept });
+  }
+}
+
+function revokeCtrl() {
+  send({ type: 'ctrl', action: 'revoke' });
+  ctrlHost = null;
+  $('ctrlBanner').hidden = true;
+}
+
+// contain 坐标换算：视频画面（object-fit:contain 可能有黑边）→ 0-65535 绝对坐标
+// contain 坐标换算：视频画面（object-fit:contain 可能有黑边）→ 0-65535 绝对坐标
+// 落在黑边（非画面区域）返回 null——多屏/异形屏宽高比导致的黑边不响应控制
+function ctlCoords(video, clientX, clientY) {
+  const vw = video.videoWidth || 1920, vh = video.videoHeight || 1080;
+  const rect = video.getBoundingClientRect();
+  const scale = Math.min(rect.width / vw, rect.height / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const ox = (rect.width - dw) / 2, oy = (rect.height - dh) / 2;
+  const px = (clientX - rect.left - ox) / scale;
+  const py = (clientY - rect.top - oy) / scale;
+  if (px < 0 || py < 0 || px > vw || py > vh) return null; // 黑边区域：不响应
+  return {
+    x: Math.max(0, Math.min(65535, Math.round(px / vw * 65535))),
+    y: Math.max(0, Math.min(65535, Math.round(py / vh * 65535)))
+  };
+}
+
+// 拖动中移动事件节流（≤30/s，避免事件风暴卡死——历史失败根因 1）
+function ctlSendMove(video, clientX, clientY) {
+  const now = Date.now();
+  if (now - ctlMoveThrottle.last < 33) return;
+  ctlMoveThrottle.last = now;
+  const c = ctlCoords(video, clientX, clientY);
+  if (!c) return; // 黑边：不发送
+  send({ type: 'ctrl', action: 'mouse', x: c.x, y: c.y });
+}
+
+// 目标流 ownerId（流 id 可能为 ownerId 或 ownerId-cam）
+const ctlOwnerOf = sid => streamOwners.get(sid) || sid;
+
+// 视频容器绑定远程控制覆盖层（video=媒体元素，wrap=相对定位容器，streamId=流 id）
+function attachCtlOverlay(video, wrap, streamId) {
+  if (!video || !wrap || wrap._ctlAttached) return;
+  wrap._ctlAttached = true;
+  const layer = document.createElement('div');
+  layer.className = 'ctlLayer';
+  layer.tabIndex = 0; // 可聚焦：键盘事件目标（修复历史失败根因 4：未 focus 键盘不触发）
+  layer.dataset.stream = streamId; // 供 applyCtlLayer 匹配当前控制目标
+  layer.innerHTML = '<span class="ctlBadge">远程控制中</span>';
+  wrap.appendChild(layer);
+
+  const active = () => !!(ctrlView && ctrlView.active && ctlOwnerOf(streamId) === ctrlView.target);
+
+  layer.addEventListener('pointerdown', e => {
+    if (!active()) return;
+    const c = ctlCoords(video, e.clientX, e.clientY);
+    if (!c) return; // 黑边区域：不响应
+    if (e.button === 1) e.preventDefault(); // 中键点击滚动拦截
+    layer.setPointerCapture(e.pointerId); // pointer capture 管理（修复历史失败根因 2）
+    const btn = e.button === 2 ? 'right' : (e.button === 1 ? 'middle' : 'left');
+    send({ type: 'ctrl', action: 'mouse', x: c.x, y: c.y });
+    send({ type: 'ctrl', action: 'click', button: btn, down: true });
+    layer._downBtn = btn;
+  });
+  layer.addEventListener('pointermove', e => {
+    if (active() && layer._downBtn) ctlSendMove(video, e.clientX, e.clientY); // 拖动合成：仅按下期间跟随
+  });
+  const releaseBtn = e => {
+    if (!layer._downBtn) return;
+    send({ type: 'ctrl', action: 'click', button: layer._downBtn, down: false });
+    layer._downBtn = null;
+    try { layer.releasePointerCapture(e.pointerId); } catch (err) {}
+  };
+  layer.addEventListener('pointerup', releaseBtn);
+  layer.addEventListener('pointercancel', releaseBtn);
+  layer.addEventListener('contextmenu', e => { if (active()) e.preventDefault(); });
+  layer.addEventListener('wheel', e => {
+    if (!active()) return;
+    e.preventDefault();
+    send({ type: 'ctrl', action: 'scroll', dy: Math.sign(e.deltaY) });
+  }, { passive: false });
+  layer.addEventListener('keydown', e => {
+    if (!active()) return;
+    e.preventDefault();
+    if (e.repeat) return; // 按住由系统自动重复（发送一次 down 即可）
+    send({ type: 'ctrl', action: 'key', code: e.code, down: true });
+  });
+  layer.addEventListener('keyup', e => {
+    if (!active()) return;
+    e.preventDefault();
+    send({ type: 'ctrl', action: 'key', code: e.code, down: false });
+  });
+}
+
+// 按控制状态显示/隐藏覆盖层并管理焦点
+function applyCtlLayer() {
+  const on = !!(ctrlView && ctrlView.active);
+  document.querySelectorAll('.ctlLayer').forEach(l => {
+    const isTarget = on && ctlOwnerOf(l.dataset.stream) === ctrlView.target;
+    l.classList.toggle('on', !!isTarget);
+    if (isTarget) l.focus();
+  });
+  // 控制条按钮激活态
+  document.querySelectorAll('.ctlBtn').forEach(b => {
+    const owner = ctlOwnerOf(b.dataset.ctl);
+    b.classList.toggle('active', on && owner === ctrlView.target);
+  });
+}
+
+// 音量控制已由音频通道条（chanBar）独立实现（0-200% 滑块/静音/均衡/波形/提醒）
+
+// 设置档位（幂等：选中当前档位不触发）
+function setTier(streamId, tier) {
+  if (manualTier.get(streamId) === tier) return;
+  manualTier.set(streamId, tier);
+  document.querySelectorAll(`select.tierSel[data-stream="${streamId}"]`).forEach(s => s.value = tier);
+  send({ type: 'viewer-config', streamId, tier });
+}
+
+// 流 id → 卡片媒体元素：音频通道(ownerID-a-kind) → 卡片通道条 audio；视频流(ownerID) → 卡片 video；摄像头流(ownerID-cam) → 卡片摄像头 video
+function mediaElOf(streamId) {
+  if (streamId.includes('-a-')) {
+    const parts = streamId.split('-'); // [ownerId, a, kind]
+    const el = document.getElementById('card-' + parts[0]);
+    return el ? el.querySelector(`[data-chan="${parts[0]}-${parts[2]}"] audio`) : null;
+  }
+  if (streamId.endsWith('-cam')) {
+    const ownerId = streamId.slice(0, -4);
+    const el = document.getElementById('card-' + ownerId);
+    return el ? el.querySelector('[data-cam]') : null;
+  }
+  const el = document.getElementById('card-' + streamId);
+  return el ? el.querySelector('video') : null;
+}
+
+// RMS 电平计算（0-1）
+function getRMS(analyser) {
+  const data = new Uint8Array(analyser.fftSize);
+  analyser.getByteTimeDomainData(data);
+  let sum = 0;
+  for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+  return Math.sqrt(sum / data.length);
+}
+function rmsToDb(rms) { return rms <= 0.001 ? '-∞' : (20 * Math.log10(rms)).toFixed(1); }
+
+// 接收端音频通道条：每通道独立 Web Audio（智能响度均衡 / 音量 0-200% / 波形 / 响度条 / RMS 提醒）
+// 音频通道条用户设置持久化（renderGrid 重建后恢复音量/静音/均衡）
+let chanState = new Map(); // "ownerId-kind" -> {vol, muted, eq}
+// 音频流缓存（renderGrid 重建后恢复通道条；音频流不入 streamCache，独立维护）
+let audioCache = new Map(); // "ownerId-kind" -> MediaStream
+
+function addAudioChannel(ownerId, kind, stream) {
+  const bar = document.querySelector(`[data-audio-bar="${ownerId}"]`);
+  if (!bar) return;
+  const key = ownerId + '-' + kind;
+  const st = chanState.get(key) || { vol: 100, muted: false, eq: false }; // 默认有声（100%）
+  let chan = bar.querySelector(`[data-chan="${key}"]`);
+  if (chan && chan._wa) { chan.querySelector('audio').srcObject = stream; return; } // 处理链已建：仅更新流（防重复 AudioContext 泄漏）
+  if (!chan) {
+    chan = document.createElement('div');
+    chan.className = 'chanBar';
+    chan.dataset.chan = key;
+    chan.innerHTML = `
+      <span class="hint">${kind === 'mic' ? '麦克风音频' : '标签页音频'}</span>
+      <button class="ctrl" data-vol title="声音">${ICON_MUTED}</button>
+      <input type="range" class="chanVol" min="0" max="600" value="100">
+      <span class="hint chanVolTxt">100%</span>
+      <label>智能响度均衡 <input type="checkbox" class="chanEq"></label>
+      <canvas class="chanWave" width="140" height="28"></canvas>
+      <canvas class="chanLevel" width="50" height="8"></canvas>
+      <span class="hint chanDb">-60dB</span>
+      <span class="hint chanWarn"></span>
+      <button class="ctrl" data-achan-detail title="详细">${ICON_INFO}</button>
+      <dl class="kv" id="detail-${ownerId}-a-${kind}" hidden></dl>
+      <audio autoplay playsinline muted></audio>`;
+    bar.appendChild(chan);
+    chan.querySelector('[data-achan-detail]').onclick = () => openDetail(ownerId + '-a-' + kind); // sid 与 stats 一致
+  }
+  const audioEl = chan.querySelector('audio');
+  audioEl.srcObject = stream;
+  // Web Audio 链（无损默认 + 安全网）：src → analyserSrc(监测·透明) → gain(手动) → safetyComp(-24dB 防削波) → analyserOut(波形/响度·透明) → destination
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx();
+  const src = ctx.createMediaStreamSource(stream);
+  const analyserSrc = ctx.createAnalyser();
+  analyserSrc.fftSize = 1024;
+  const agcGain = ctx.createGain(); // 智能均衡用（默认不接入）
+  agcGain.gain.value = 1;
+  const compressor = ctx.createDynamicsCompressor(); // 智能均衡用（默认不接入）
+  const gain = ctx.createGain();
+  gain.gain.value = st.muted ? 0 : st.vol / 100; // 应用持久化状态（默认有声）
+  ctx.resume().catch(() => {}); // 尝试立即出声（部分浏览器需首次交互后生效）
+  const safetyComp = ctx.createDynamicsCompressor(); // 安全网：-24dB 以下完全透明，高增益防削波
+  safetyComp.threshold.value = -24;
+  safetyComp.ratio.value = 12;
+  safetyComp.attack.value = 0.001;
+  safetyComp.release.value = 0.1;
+  const analyserOut = ctx.createAnalyser();
+  analyserOut.fftSize = 1024;
+  src.connect(analyserSrc);
+  analyserSrc.connect(gain);
+  gain.connect(safetyComp);
+  safetyComp.connect(analyserOut);
+  analyserOut.connect(ctx.destination);
+  chan._wa = { ctx, src, compressor, agcGain, gain, safetyComp, analyserSrc, analyserOut };
+  // 恢复持久化 UI 状态
+  const volSlider = chan.querySelector('.chanVol');
+  const volTxt = chan.querySelector('.chanVolTxt');
+  const volBtn = chan.querySelector('[data-vol]');
+  const eqChk = chan.querySelector('.chanEq');
+  volSlider.value = st.vol;
+  volTxt.textContent = st.vol + '%';
+  eqChk.checked = st.eq;
+  // 图标反映实际声音状态：用户静音 或 AudioContext 未激活（浏览器策略）都显示静音图标
+  const updateVolIcon = () => {
+    const running = chan._wa.ctx.state === 'running';
+    volBtn.innerHTML = (st.muted || !running) ? ICON_MUTED : ICON_VOLUME;
+  };
+  updateVolIcon();
+  chan._wa.ctx.addEventListener('statechange', updateVolIcon); // 激活/暂停自动切换图标
+  // 音量滑块（0-600%）：拖动即恢复有声；平滑过渡
+  let volOn = !st.muted;
+  volSlider.addEventListener('input', e => {
+    chan._wa.ctx.resume().catch(() => {});
+    const v = Number(e.target.value);
+    st.vol = v;
+    chanState.set(key, st);
+    gain.gain.setTargetAtTime(v / 100, ctx.currentTime + 0.05, 0.05);
+    volTxt.textContent = v + '%';
+    volOn = true;
+    st.muted = false;
+    updateVolIcon();
+  });
+  // 智能响度均衡（动态接入 agcGain+compressor 闭环；默认关，无损直通）
+  let agcTimer = null;
+  eqChk.addEventListener('change', e => {
+    chan._wa.ctx.resume().catch(() => {});
+    const on = e.target.checked;
+    st.eq = on;
+    chanState.set(key, st);
+    try {
+      if (on) {
+        try { analyserSrc.disconnect(gain); } catch (err) {}
+        analyserSrc.connect(agcGain);
+        agcGain.connect(compressor);
+        compressor.connect(gain);
+        compressor.threshold.value = -30;
+        compressor.ratio.value = 4;
+        if (!agcTimer) agcTimer = setInterval(() => {
+          const wa = chan._wa;
+          if (!wa || !chan.isConnected) { clearInterval(agcTimer); agcTimer = null; return; } // 通道销毁自动停止
+          const rms = getRMS(wa.analyserSrc);
+          if (rms < 0.01) return;
+          let next = Math.max(0.5, Math.min(8, 0.3 / rms)); // 目标响度 RMS 0.3
+          const cur = wa.agcGain.gain.value;
+          const maxDelta = Math.max(cur * 0.5, 0.1); // 变化速率限制 ±50%
+          if (next > cur + maxDelta) next = cur + maxDelta;
+          if (next < cur - maxDelta) next = cur - maxDelta;
+          wa.agcGain.gain.setTargetAtTime(next, wa.ctx.currentTime + 0.1, 0.5); // 未来时间+平滑
+        }, 200);
+      } else {
+        agcGain.gain.value = 1;
+        if (agcTimer) { clearInterval(agcTimer); agcTimer = null; }
+        try { analyserSrc.disconnect(agcGain); agcGain.disconnect(compressor); compressor.disconnect(gain); } catch (err) {}
+        analyserSrc.connect(gain); // 恢复无损直通
+        compressor.threshold.value = 0;
+        compressor.ratio.value = 1;
+      }
+    } catch (err) {}
+  });
+  // 静音按钮（gain 0 / 恢复至滑块值，平滑过渡）
+  volBtn.onclick = () => {
+    chan._wa.ctx.resume().catch(() => {});
+    volOn = !volOn;
+    st.muted = !volOn;
+    chanState.set(key, st);
+    gain.gain.setTargetAtTime(volOn ? Number(volSlider.value) / 100 : 0, ctx.currentTime + 0.05, volOn ? 0.05 : 0.03);
+    updateVolIcon();
+  };
+  if (st.eq) eqChk.dispatchEvent(new Event('change')); // 应用持久化均衡状态
+  startChanWave(chan);
+  startChanMeter(chan);
+}
+
+function startChanWave(chan) {
+  const canvas = chan.querySelector('.chanWave');
+  const wa = chan._wa;
+  if (!canvas || !wa) return;
+  const g = canvas.getContext('2d');
+  const data = new Uint8Array(wa.analyserOut.fftSize);
+  (function draw() {
+    if (!chan.isConnected) return;
+    wa.analyserOut.getByteTimeDomainData(data);
+    g.clearRect(0, 0, canvas.width, canvas.height);
+    g.strokeStyle = '#60a5fa'; g.lineWidth = 1; g.beginPath();
+    const step = canvas.width / data.length;
+    for (let i = 0; i < data.length; i++) {
+      const y = (data[i] - 128) / 128 * (canvas.height / 2) + canvas.height / 2;
+      i ? g.lineTo(i * step, y) : g.moveTo(0, y);
+    }
+    g.stroke();
+    // 响度条 + dB（基于输出电平，随本地增益变化，直观反映实际听感）
+    const level = chan.querySelector('.chanLevel');
+    const dbTxt = chan.querySelector('.chanDb');
+    if (level && dbTxt && chan._wa) {
+      const rms = getRMS(chan._wa.analyserOut);
+      const lg = level.getContext('2d');
+      lg.clearRect(0, 0, level.width, level.height);
+      const w = Math.max(1, Math.floor(level.width * Math.min(1, rms / 0.9)));
+      lg.fillStyle = rms > 0.7 ? '#fca5a5' : rms > 0.4 ? '#fde68a' : '#86efac';
+      lg.fillRect(0, 0, w, level.height);
+      dbTxt.textContent = rmsToDb(rms) + 'dB' + (rms > 0.9 ? ' ⚠可能削波，请降低音量或调高系统音量' : '');
+    }
+    requestAnimationFrame(draw);
+  })();
+}
+
+// RMS 电平监测（基于源电平）：过大（>0.85 持续 2s）红提示；过小（<0.05 持续 5s）黄提示
+function startChanMeter(chan) {
+  const warn = chan.querySelector('.chanWarn');
+  const wa = chan._wa;
+  if (!warn || !wa) return;
+  let loud = 0, quiet = 0;
+  setInterval(() => {
+    if (!chan.isConnected) return;
+    const rms = getRMS(wa.analyserSrc);
+    if (rms > 0.85) { loud++; quiet = 0; if (loud >= 4) { warn.textContent = '⚠ 音量过大'; warn.className = 'hint chanWarn err'; } }
+    else if (rms < 0.05) { quiet++; loud = 0; if (quiet >= 10) { warn.textContent = '音量过小，可调高或检查共享端'; warn.className = 'hint chanWarn warn'; } }
+    else { loud = 0; quiet = 0; warn.textContent = ''; }
+  }, 500);
+}
+
+// 全屏/PiP 观看期间抑制卡片重建（防全屏被踢出、用户设置被清），退出后补齐
+let gridDirty = false;
+
+function renderGrid() {
+  if (watchMode && (watchMode.kind === 'fullscreen' || watchMode.kind === 'pip')) {
+    gridDirty = true; // 观看中：状态照常更新，仅延迟重绘
+    return;
+  }
+  rebuildGrid();
+}
+
+function rebuildGrid() {
+  // 重建前关闭所有旧通道 AudioContext（DOM 移除不会自动回收；
+  // 否则恢复循环新建处理链后旧链继续输出 → 双链叠加、音量调节失效、累积泄漏）
+  document.querySelectorAll('.chanBar').forEach(c => {
+    if (c._wa && c._wa.ctx) c._wa.ctx.close().catch(() => {});
+  });
+  const grid = $('grid');
+  const mine = document.getElementById('myCard');
+  const hostMap = new Map([...peers.values()].filter(p => p.host).map(p => [p.id, p]));
+  if (myIsHost) hostMap.set(myId, { id: myId, name: myName, host: true }); // welcome.peers 不含自己，host 需自补
+  // 服务器主机全局编号：所有节点（含本节点）按 nodeId 排序，序号跨节点一致（S1、S2…）
+  const nodeSeq = {};
+  [nodeId, ...netNodes.map(n => n.id)].sort().forEach((nid, i) => { nodeSeq[nid] = i + 1; });
+  grid.innerHTML = '';
+  if (mine) grid.appendChild(mine);
+  for (const [id, info] of peers) {
+    let card = document.getElementById('card-' + id);
+    if (!card) {
+      card = document.createElement('section');
+      card.className = 'pcard';
+      card.id = 'card-' + id;
+      grid.appendChild(card);
+    }
+    const videoStreamId = streamOwners.has(id) ? id : null;
+    const camStreamId = streamOwners.has(id + '-cam') ? (id + '-cam') : null;
+    const audioStreamId = streamOwners.has(id + '-a') ? (id + '-a') : null;
+    const vCached = videoStreamId ? streamCache.get(videoStreamId) : null;
+    const camCached = camStreamId ? streamCache.get(camStreamId) : null;
+    const sharing = !!videoStreamId;
+    const camSharing = !!camStreamId;
+    const hasVideo = sharing && !!vCached;
+    const hasAudioStream = !!audioStreamId;
+    const pill = sharing ? '<span class="pill on">共享中</span>'
+      : (hasAudioStream ? '<span class="pill on">音频中</span>' : '<span class="pill">在线</span>');
+    // 服务运行者徽章带全局节点编号：本地 host 属本节点（nodeId）；远端 host 属其 id 前缀节点
+    const hostNode = info.id.includes(':') ? info.id.split(':')[0] : nodeId;
+    const hostPill = info.host ? `<span class="pill host">服务器主机 S${nodeSeq[hostNode] || '?'}</span>` : '';
+    // 该用户所属节点的服务运行者；hostId 失效（host 重连换 id）时回退本节点当前 host
+    const hostPeer = hostMap.get(info.hostId) || [...hostMap.values()][0];
+    card.innerHTML = `
+      <div class="phead"><span class="dot" style="background:${info.color}"></span>
+        <span class="pname">${escapeHtml(info.name)}</span>
+        ${pill}${hostPill}
+      </div>
+      <span class="rttBadge" id="rtt-${id}">${info.rtt ? info.rtt + 'ms' : '—'}</span>
+      ${sharing ? `<div class="videoWrap"><video autoplay playsinline muted></video><div class="camStats" data-vstats-bar="${id}" title="点击查看详细统计"><span data-vstats="${id}"></span><span data-vdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id)}</div>` : ''}
+      ${camSharing ? `<div class="camWrap"><video data-cam="${id}" autoplay playsinline muted></video><div class="camStats" data-camstats-bar="${id}" title="点击查看详细统计"><span data-camstats="${id}"></span><span data-cdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id + '-cam')}</div>` : ''}
+      ${hasAudioStream ? `
+        <div class="audioBar" data-audio-bar="${id}"></div>` : ''}
+      <div class="pbody">
+        ${(myIsHost && myStream) ? `<div class="inviteRow"><button class="btn mini" data-invite-card="${id}">邀请控制</button></div>` : ''}
+        <p class="stats">对方 IP：${info.ip || '-'} - 主机：${hostPeer ? hostPeer.name : (info.enterHost || addrList[0] || '-')}</p>
+        <dl class="kv" id="detail-${id}" hidden></dl>
+        ${camSharing ? `<dl class="kv" id="detail-${id}-cam" hidden></dl>` : ''}
+      </div>`;
+    // 邀请对方控制（仅 host 共享屏幕中显示）：文字按钮直达该用户
+    const invCardBtn = card.querySelector('[data-invite-card]');
+    if (invCardBtn) invCardBtn.onclick = () => {
+      openCtrlApply('邀请对方控制',
+        `确认邀请 ${escapeHtml(info.name)}（${id}）控制你的屏幕？\n\n对方同意后将获得控制权，你可随时收回。`,
+        '发送邀请', () => {
+          send({ type: 'ctrl', action: 'invite', target: id });
+          flashMsg('已发送控制邀请，等待对方回应…');
+        });
+    };
+    // 主视频区绑定
+    if (sharing) {
+      const sel = card.querySelector('.tierSel');
+      sel.value = manualTier.get(id) || 'l';
+      sel.onchange = e => setTier(id, e.target.value);
+      card.querySelectorAll('.ctrl[data-watch]').forEach(b => {
+        b.onclick = () => activateWatch(b.dataset.watch, id);
+      });
+      card.querySelector('video').addEventListener('leavepictureinpicture', () => {
+        if (watchMode && watchMode.kind === 'pip' && watchMode.id === id) deactivateWatch('pip');
+      });
+      if (vCached) card.querySelector('video').srcObject = vCached;
+      const vBar = card.querySelector('[data-vstats-bar]');
+      if (vBar) vBar.onclick = () => openDetail(id); // 整个状态条可点击
+      const vdBtn = card.querySelector('[data-vdetail]');
+      if (vdBtn) vdBtn.onclick = () => openDetail(id);
+      // 远程控制：按钮 + 覆盖层
+      card.querySelectorAll('[data-ctl]').forEach(b => { b.onclick = () => requestCtrl(b.dataset.ctl); });
+      attachCtlOverlay(card.querySelector('video'), card.querySelector('.videoWrap'), id);
+    }
+    // 摄像头区绑定（与屏幕共享相同的控制条/档位/观看方式）
+    if (camSharing) {
+      const camId = id + '-cam';
+      const sel = card.querySelector('.tierSel[data-stream="' + camId + '"]');
+      if (sel) {
+        sel.value = manualTier.get(camId) || 'l';
+        sel.onchange = e => setTier(camId, e.target.value);
+      }
+      card.querySelectorAll('.ctrl[data-watch][data-stream="' + camId + '"]').forEach(b => {
+        b.onclick = () => activateWatch(b.dataset.watch, camId);
+      });
+      card.querySelectorAll('[data-ctl][data-stream="' + camId + '"]').forEach(b => { b.onclick = () => requestCtrl(b.dataset.ctl); });
+      const cv = card.querySelector('[data-cam]');
+      if (cv) {
+        cv.addEventListener('leavepictureinpicture', () => {
+          if (watchMode && watchMode.kind === 'pip' && watchMode.id === camId) deactivateWatch('pip');
+        });
+        if (camCached) cv.srcObject = camCached;
+      }
+      attachCtlOverlay(cv, card.querySelector('.camWrap'), camId);
+      const cBar = card.querySelector('[data-camstats-bar]');
+      if (cBar) cBar.onclick = () => openDetail(camId); // 整个状态条可点击
+      const cdBtn = card.querySelector('[data-cdetail]');
+      if (cdBtn) cdBtn.onclick = () => openDetail(camId);
+    }
+    // 音频通道由 ontrack 动态创建通道条（每通道独立音量/均衡/波形/提醒）
+  }
+  // 卡片重建后恢复控制覆盖层状态与音频通道条
+  applyCtlLayer();
+  // 卡片重建后恢复已到达的音频通道条（renderGrid 的 innerHTML 会清空通道条，
+  // 音频轨不会再次触发 ontrack，需按 audioCache 缓存流重新插入）
+  for (const [key, stream] of audioCache) {
+    const sep = key.lastIndexOf('-');
+    addAudioChannel(key.slice(0, sep), key.slice(sep + 1), stream);
+  }
+}
+
+let watchMode = null; // {kind:'overlay'|'fullscreen'|'pip', id}
+// 远程控制（P2-2）状态：ctrlView=控制端视角；ctrlPendingReq/ctrlHost=被控端视角
+let ctrlView = null;       // {target, active}
+let ctrlPendingReq = null; // 被控端：待确认请求 {controller, controllerName}
+let ctrlHost = null;       // 被控端：当前控制者 {controller, controllerName}
+const ctlMoveThrottle = { last: 0 };
+let pipError = null;  // {streamId, msg} PiP 错误提示（详情展示，不被轮询覆盖）
+let pipRequestAt = 0; // PiP 请求发起时间（兜底宽限期）
+
+// 网页全屏（影院模式）：视频充满整个视口
+function openCinema(streamId) {
+  const info = peers.get(streamId) || {};
+  $('cinemaDot').style.background = info.color || '#9fb3d1';
+  $('cinemaTitle').textContent = info.name || streamId;
+  const cached = streamCache.get(streamId);
+  if (cached) $('cinemaVideo').srcObject = cached;
+  $('cinema').hidden = false;
+  focused = streamId; // 仅用于影院视频同步，不改变档位
+  // 影院内控制条（画质 + 全屏/画中画/旋转切换；音量在卡片音频通道条控制）
+  const box = $('cinemaControls');
+  box.innerHTML = controlsHTML(streamId);
+  box.querySelector('.tierSel').value = manualTier.get(streamId) || 'l';
+  box.querySelector('.tierSel').onchange = e => setTier(streamId, e.target.value);
+  box.querySelectorAll('.ctrl').forEach(b => {
+    if (b.dataset.watch) b.onclick = () => activateWatch(b.dataset.watch, streamId);
+  });
+  box.querySelectorAll('[data-ctl]').forEach(b => { b.onclick = () => requestCtrl(b.dataset.ctl); });
+  // 影院内远程控制覆盖层（叠加在视频上，控制条 cinemaBottom z-index 2 在上）
+  attachCtlOverlay($('cinemaVideo'), $('cinema'), streamId);
+  applyCtlLayer();
+  // 底部状态条：点击打开该流详情弹窗
+  const st = $('cinemaStats');
+  st.innerHTML = '<span>加载中…</span>';
+  st.onclick = () => openDetail(streamId);
+}
+
+function closeCinema() {
+  $('cinema').hidden = true;
+  $('cinemaVideo').srcObject = null;
+  $('cinemaStats').innerHTML = '';
+}
+
+// 三种观看方式统一入口：网页全屏（影院）/ 真全屏 / 画中画
+// 重复点击当前图标 = 退出；切换模式自动收尾当前模式
+function activateWatch(kind, streamId) {
+  const video = videoOfStream(streamId);
+  if (!video) return;
+  if (watchMode && watchMode.kind === kind && watchMode.id === streamId) {
+    deactivateWatch(kind); // 重复点击当前激活图标 = 退出
+    return;
+  }
+  if (watchMode && watchMode.kind !== kind) {
+    deactivateWatch(watchMode.kind); // 切换模式：先收尾当前模式
+  }
+  if (kind === 'cinema') {
+    watchMode = { kind, id: streamId };
+    openCinema(streamId);
+  } else if (kind === 'fullscreen') {
+    watchMode = { kind, id: streamId };
+    focused = streamId;
+    const wrap = video.closest('.videoWrap') || video.closest('.camWrap') || video; // 容器全屏（屏幕/摄像头），控制条随容器进入全屏
+    wrap.requestFullscreen().catch(() => { deactivateWatch('fullscreen'); });
+  } else if (kind === 'pip') {
+    pipError = null;
+    watchMode = { kind, id: streamId };
+    // 画中画不改变档位、不触发切层——切层会触发 ontrack 替换 srcObject，导致 PiP 窗口立即关闭
+    requestPip(video, streamId);
+  }
+  updateWatchButtons();
+}
+
+// 画中画：仅在用户手势内同步发起（异步调用会因手势失效抛 NotAllowedError）
+function requestPip(video, streamId) {
+  if (!video || !watchMode || watchMode.kind !== 'pip' || watchMode.id !== streamId) return;
+  pipRequestAt = Date.now();
+  if (document.pictureInPictureElement && document.pictureInPictureElement !== video) {
+    deactivateWatch('pip');
+    pipError = { streamId, msg: '请先关闭当前画中画再试' };
+    return;
+  }
+  if (video.readyState < 2 || !video.videoWidth) { // 硬指标：实际渲染出帧才可 PiP
+    deactivateWatch('pip');
+    pipError = { streamId, msg: '画面状态切换中，请稍后再点' };
+    return;
+  }
+  video.requestPictureInPicture().then(() => {
+    pipError = null;
+  }).catch(err => {
+    const name = err && err.name || String(err);
+    deactivateWatch('pip');
+    pipError = { streamId, msg: name === 'NotAllowedError' ? '手势失效，请再点一次' :
+      (name === 'NotSupportedError' ? '当前设备/浏览器不支持画中画' :
+      (name === 'InvalidStateError' ? '画面状态切换中，请稍后再点一次' : ('画中画失败：' + name))) };
+    console.error('PiP error:', err);
+  });
+}
+
+
+function deactivateWatch(kind) {
+  if (watchMode && watchMode.kind === kind) watchMode = null;
+  if (kind === 'cinema') closeCinema();
+  if (kind === 'pip' && document.pictureInPictureElement) {
+    document.exitPictureInPicture().catch(() => {}); // 切换模式时关闭 PiP 窗口
+  }
+  if (kind === 'fullscreen' && document.fullscreenElement) {
+    document.exitFullscreen().catch(() => {}); // 切换模式时退出全屏
+  }
+  if (!watchMode) {
+    focused = null; // 观看方式不改变档位，退出时仅清理状态
+  }
+  if (gridDirty && !watchMode) { // 全屏/PiP 期间积压的重建，退出后补齐
+    gridDirty = false;
+    rebuildGrid();
+  }
+  updateWatchButtons();
+}
+
+function updateWatchButtons() {
+  document.querySelectorAll('[data-watch]').forEach(b => {
+    const kind = b.dataset.watch;
+    // 优先用 data-stream（影院控制条不在卡片内），回退从卡片 id 取
+    const sid = b.dataset.stream || (b.closest('.pcard') ? b.closest('.pcard').id.replace('card-', '') : '');
+    const on = watchMode && watchMode.kind === kind && watchMode.id === sid; // 只高亮当前流的按钮
+    b.classList.toggle('on', on);
+  });
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && watchMode && watchMode.kind === 'cinema') deactivateWatch('cinema');
+});
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && watchMode && watchMode.kind === 'fullscreen') {
+    deactivateWatch('fullscreen');
+  }
+});
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ---------- 统计 ---------- */
+
+// 详情弹窗：屏幕/摄像头独立展示（读隐藏 dl 数据源，videoStats 实时刷新）
+let detailModalTarget = null;
+
+function openDetail(sid) {
+  detailModalTarget = sid;
+  const isCam = sid.endsWith('-cam');
+  const isAudio = sid.includes('-a-');
+  const ownerId = isCam ? sid.slice(0, -4) : (isAudio ? sid.split('-')[0] : sid);
+  const kindTxt = isCam ? '摄像头' : (isAudio ? (sid.split('-')[2] === 'mic' ? '麦克风' : '标签页音频') : '屏幕');
+  const info = peers.get(ownerId) || {};
+  $('detailModalTitle').textContent = `${info.name || ownerId} 的${kindTxt}详细`;
+  const dl = document.getElementById('detail-' + sid);
+  $('detailModalBody').innerHTML = dl && dl.innerHTML ? dl.innerHTML : '<dt>状态</dt><dd class="ok">已连接</dd>';
+  $('detailModal').hidden = false;
+}
+
+function closeDetail() {
+  $('detailModal').hidden = true;
+  detailModalTarget = null;
+}
+
+function videoStats() {
+  // 兜底：PiP 窗口已关闭但状态未清除（卡片重建等场景）——请求发起后 10 秒宽限
+  if (watchMode && watchMode.kind === 'pip' && !document.pictureInPictureElement && Date.now() - pipRequestAt > 10000) {
+    deactivateWatch('pip');
+  }
+  const mine = document.getElementById('myCard');
+  if (!mine) return;
+  const st = mine.querySelector('#myStats');
+  if (!subPC) {
+    st.textContent = myStream
+      ? (myWatchers > 0 ? `共享中，${myWatchers} 人正在观看` : '共享中，等待他人加入…')
+      : (Object.keys(audioTracks).length > 0 ? '音频共享中…' : '等待他人共享…');
+    return;
+  }
+  // 统计：中继 subPC（视频/音频轨经 trackOf 关联流 id）
+  Promise.all([subPC.getStats()]).then(results => {
+    const allStats = [];
+    results.forEach(rs => rs.forEach(s => allStats.push(s)));
+    let recv = 0, lost = 0, pkts = 0;
+    const perStream = new Map(); // streamId -> 指标
+    let pair = null, dtls = '', iceRole = '', selectedPairId = '';
+    allStats.forEach(s => {
+      if (s.type === 'inbound-rtp' && (s.kind === 'video' || s.kind === 'audio')) {
+        if (s.kind === 'video') {
+          recv += s.bytesReceived || 0;
+          lost += s.packetsLost || 0;
+          pkts += s.packetsReceived || 0;
+        }
+        const sid = trackOf.get(s.trackId) || midOf.get(s.mid) || ssrcOf.get(s.ssrc);
+        if (sid) {
+          const m = perStream.get(sid) || { kind: s.kind, bytes: 0, lost: 0, pkts: 0, fps: 0, decoded: 0, dropped: 0, keyFrames: 0, jitter: 0, codec: '', codecId: '', clockRate: 0, channels: 0 };
+          m.kind = s.kind;
+          m.bytes = s.bytesReceived || 0;
+          m.lost = s.packetsLost || 0;
+          m.pkts = s.packetsReceived || 0;
+          m.fps = s.framesPerSecond || 0;
+          m.decoded = s.framesDecoded || 0;
+          m.dropped = s.framesDropped || 0;
+          m.keyFrames = s.keyFramesDecoded || 0;
+          m.jitter = s.jitter || 0;
+          if (!m.codecId) m.codecId = s.codecId;
+          perStream.set(sid, m);
+        }
+      }
+      if (s.type === 'candidate-pair' && (s.state === 'succeeded' || s.state === 'completed' || s.nominated)) {
+        if (!pair || s.nominated) pair = s;
+      }
+      if (s.type === 'transport' && s.selectedCandidatePairId) {
+        selectedPairId = s.selectedCandidatePairId;
+        dtls = s.dtlsState || '';
+        iceRole = s.iceRole || '';
+      }
+    });
+    // codec 匹配（第二遍，避免记录顺序问题）
+    allStats.forEach(s => {
+      if (s.type !== 'codec') return;
+      for (const m of perStream.values()) {
+        if (m.codecId === s.id && !m.codec) {
+          m.codec = s.mimeType || '';
+          m.clockRate = s.clockRate || 0;
+          m.channels = s.channels || 0;
+        }
+      }
+    });
+    if (selectedPairId && pair && pair.id !== selectedPairId) {
+      allStats.forEach(s => { if (s.type === 'candidate-pair' && s.id === selectedPairId) pair = s; });
+    }
+    let lc = {}, rc = {};
+    if (pair) {
+      allStats.forEach(s => {
+        if (s.type === 'local-candidate' && s.id === pair.localCandidateId) lc = s;
+        if (s.type === 'remote-candidate' && s.id === pair.remoteCandidateId) rc = s;
+      });
+      if (!lc.address) allStats.forEach(s => { if (s.type === 'local-candidate' && s.address && !lc.address) lc = s; });
+      if (!rc.address) allStats.forEach(s => { if (s.type === 'remote-candidate' && s.address && !rc.address) rc = s; });
+    }
+    const rtt = pair && pair.currentRoundTripTime ? (pair.currentRoundTripTime * 1000).toFixed(0) + 'ms' : '-';
+    const pathTxt = !pair ? '<span class="err">未建立</span>' :
+      (lc.candidateType === 'relay' ? '<span class="warn">TCP 中继</span>' : '<span class="ok">IPv6 直连</span>');
+    const pairTxt = lc.address ? `${lc.address}:${lc.port} ⇄ ${rc.address || '-'}:${rc.port || '-'}` : '';
+    // 每卡片详情
+    perStream.forEach((m, sid) => {
+      const isAudioChan = sid.includes('-a-');
+      const isCam = sid.endsWith('-cam');
+      const ownerId = isAudioChan ? sid.split('-')[0] : (isCam ? sid.slice(0, -4) : sid);
+      const el = document.getElementById('card-' + ownerId);
+      if (!el) return;
+      const rate = streamRate(sid, m.bytes);
+      const loss = m.pkts + m.lost > 0 ? (100 * m.lost / (m.pkts + m.lost)).toFixed(1) : '-';
+      const rttTxt = rtt;
+      const pathDl = `${pathTxt}<br>${pairTxt}`;
+      const transDl = `${(lc.protocol || '-').toUpperCase()}${lc.candidateType === 'relay' ? ' (TURN)' : ''}`;
+      const dtlsDl = `${dtls || '-'} / ${iceRole || '-'}`;
+      if (isAudioChan) {
+        // 音频通道：通道条速率/丢包 + 通道级详细（弹窗）+ 汇总面板
+        const kind = sid.split('-')[2];
+        const chan = el.querySelector(`[data-chan="${ownerId}-${kind}"]`);
+        if (chan) {
+          const hint = chan.querySelector('.chanWarn');
+          if (hint && !hint.textContent) hint.textContent = `${fmtRate(rate)} | 丢包 ${loss}%`;
+        }
+        const aRows = [
+          ['状态', `<span class="ok">已连接</span>（${subPC.connectionState || '-'}）`],
+          ['编解码器', `${m.codec || '-'}${m.clockRate ? ' · ' + (m.clockRate / 1000) + 'kHz' : ''}${m.channels ? ' · ' + m.channels + 'ch' : ''}`],
+          ['接收速率', fmtRate(rate)],
+          ['累计接收', `${(m.bytes / 1048576).toFixed(2)} MB`],
+          ['丢包 / 抖动', `${loss}% / ${(m.jitter * 1000).toFixed(0)}ms`],
+          ['已连接时长', fmtDur(streamStart.get(sid))],
+          ['信号 RTT', (wsRtt != null ? wsRtt + 'ms' : '-')],
+          ['RTT', rttTxt],
+          ['路径', pathDl],
+          ['传输', transDl],
+          ['DTLS / ICE 角色', dtlsDl],
+        ];
+        const adl = document.getElementById('detail-' + sid); // getElementById 避免冒号 id 在选择器中的解析问题（跨节点流 id 含冒号）
+        if (adl) {
+          adl.innerHTML = aRows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join('');
+          if (detailModalTarget === sid) $('detailModalBody').innerHTML = adl.innerHTML; // 弹窗实时同步
+        }
+        return;
+      }
+      const v = isCam ? el.querySelector('[data-cam]') : el.querySelector('video');
+      const res = v && v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : '?';
+      // 解码受限判定：以发送端配置的目标帧率为基准
+      const cfg = streamCfg.get(sid);
+      const target = (cfg && cfg.frameRate) || (isCam ? 30 : 60);
+      const limitFps = target * 0.7;
+      const lowFps = m.fps > 0 && m.fps < limitFps;
+      const cnt = decodeLimit.get(sid) || 0;
+      decodeLimit.set(sid, lowFps ? cnt + 1 : 0);
+      const isLimited = decodeLimit.get(sid) >= 3; // 连续 ~6 秒
+      const limTxt = isLimited ? ' | ⚠ 解码受限' : '';
+      const pipTxt = (pipError && pipError.streamId === sid) ? ` | ⚠ ${pipError.msg}` : '';
+      // 摄像头/主视频：接收信息叠加显示在画面左下角（与底部 stats 分离）
+      if (isCam) {
+        const cs = el.querySelector('[data-camstats]');
+        if (cs) cs.textContent = `${m.fps}fps | ${fmtRate(rate)} | 丢包 ${loss}%${limTxt}`;
+      } else {
+        const vs = el.querySelector('[data-vstats]');
+        if (vs) vs.textContent = `${m.fps}fps | ${fmtRate(rate)} | 丢包 ${loss}%${limTxt}${pipTxt}`;
+      }
+      // 影院模式（网页沉浸全屏）：底部状态条同步当前流实时信息
+      if (focused === sid && !$('cinema').hidden) {
+        $('cinemaStats').innerHTML = `<span>${m.fps}fps | ${fmtRate(rate)} | 丢包 ${loss}%${limTxt}</span><span class="detail">${ICON_INFO} 详细</span>`;
+      }
+      // 底部 stats 行：由 renderGrid 常驻显示"对方 IP + 主机昵称"，此处不再写入
+      const rows = [
+        ['状态', isLimited
+          ? `<span class="warn">⚠ 解码能力不足，帧数被限制（实际 ${m.fps}fps，发送端目标 ${target}fps）— 可切换更低档位提升帧率</span>`
+          : `<span class="ok">已连接</span>（${subPC.connectionState || '-'}）`],
+        ['分辨率', res],
+        ['帧率', m.fps + 'fps' + (isLimited ? ' <span class="warn">(受限)</span>' : '')],
+        ['接收速率', fmtRate(rate)],
+        ['累计接收', `${(m.bytes / 1048576).toFixed(2)} MB`],
+        ['丢包 / 抖动', `${loss}% / ${(m.jitter * 1000).toFixed(0)}ms`],
+        ['丢帧 / 解码', `${m.dropped} / ${m.decoded}（关键帧 ${m.keyFrames}）`],
+        ['已连接时长', fmtDur(streamStart.get(sid))],
+        ['信号 RTT', (wsRtt != null ? wsRtt + 'ms' : '-')],
+        ['编解码器', m.codec || '-'],
+        ['RTT', rttTxt],
+        ['路径', pathDl],
+        ['传输', transDl],
+        ['DTLS / ICE 角色', dtlsDl],
+      ];
+      if (pipError && pipError.streamId === sid) {
+        rows.push(['画中画', `<span class="warn">${pipError.msg}</span>`]);
+      }
+      const dl = document.getElementById('detail-' + sid);
+      if (dl) {
+        dl.innerHTML = rows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join('');
+        if (detailModalTarget === sid) $('detailModalBody').innerHTML = dl.innerHTML; // 弹窗实时同步
+      }
+    });
+    // 兜底：有画面（streamCache）但 stats 未匹配到的流，至少显示"已连接"
+    for (const id of streamOwners.keys()) {
+      if (id === myId) continue;
+      if (!perStream.has(id) && streamCache.has(id)) {
+        const isCam = id.endsWith('-cam');
+        const ownerId = isCam ? id.slice(0, -4) : id;
+        const el = document.getElementById('card-' + ownerId);
+        if (el) {
+          if (isCam) {
+            const cs = el.querySelector('[data-camstats]');
+            if (cs) cs.textContent = '已连接';
+          } else {
+            const vs = el.querySelector('[data-vstats]');
+            if (vs) vs.textContent = '已连接';
+          }
+          const dl = document.getElementById('detail-' + id);
+          if (dl) dl.innerHTML = '<dt>状态</dt><dd class="ok">已连接</dd>';
+        }
+      }
+    }
+    // 我的卡片汇总
+    const v = document.getElementById('myVideo');
+    const vs = v.videoWidth ? `${v.videoWidth}×${v.videoHeight}` : '';
+    const loss = pkts + lost > 0 ? (100 * lost / (pkts + lost)).toFixed(1) : '-';
+    const wsTxt = wsRtt != null ? `信号 ${wsRtt}ms` : '';
+    const wTxt = myStream ? (myWatchers > 0 ? `共享中，${myWatchers} 人观看 | ` : '') : '';
+    st.textContent = `${wTxt}${vs} ${wsTxt} | 收 ${fmtRate(prevRate(recv))} | 丢包 ${loss}%`;
+    // 弹窗兜底刷新：独立于 perStream 循环，确保打开中的详情实时更新
+    if (detailModalTarget) {
+      const dl = document.getElementById('detail-' + detailModalTarget);
+      if (dl && dl.innerHTML) $('detailModalBody').innerHTML = dl.innerHTML;
+    }
+  }).catch(err => console.error('[stats] 获取失败:', err));
+}
+let _prevRecv = null, _prevRecvAt = null;
+function prevRate(cur) {
+  const now = Date.now();
+  let bps = 0;
+  if (_prevRecv != null && _prevRecvAt != null && now > _prevRecvAt && cur >= _prevRecv) {
+    bps = (cur - _prevRecv) * 1000 / (now - _prevRecvAt);
+  }
+  _prevRecv = cur; _prevRecvAt = now;
+  return bps;
+}
+const _streamRate = new Map(); // streamId -> {bytes, at}
+function fmtDur(startTs) {
+  if (!startTs) return '-';
+  const s = Math.max(0, Math.floor((Date.now() - startTs) / 1000));
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+function streamRate(sid, bytes) {
+  const now = Date.now();
+  const prv = _streamRate.get(sid);
+  let bps = 0;
+  if (prv && prv.at < now && bytes >= prv.bytes) {
+    bps = (bytes - prv.bytes) * 1000 / (now - prv.at);
+  }
+  _streamRate.set(sid, { bytes, at: now });
+  return bps;
+}
+
+/* ---------- 地址/CA/防火墙 ---------- */
+
+// 剪贴板兜底（非安全上下文）
+function fallbackCopy(txt, done) {
+  const ta = document.createElement('textarea');
+  ta.value = txt;
+  ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); if (done) done(); } catch (e) {}
+  ta.remove();
+}
+
+function renderAddrs() {
+  if (!addrList.length && !netNodes.length) return; // 无可用地址时跳过
+  const pwshCmd =
+    `curl.exe -k -o "$env:TEMP\\teashare-ca.crt" "https://[${addrList[0]}]:${port}/ca.crt"; ` +
+    `Import-Certificate -FilePath "$env:TEMP\\teashare-ca.crt" -CertStoreLocation Cert:\\CurrentUser\\Root`;
+  const fwCmd =
+    `netsh advfirewall firewall add rule name="TeaShare-${port}" dir=in action=allow protocol=TCP localport=${port}\r\n` +
+    `netsh advfirewall firewall add rule name="TeaShare-turn-3478" dir=in action=allow protocol=TCP localport=3478`;
+  // 盾牌弹窗：填充防火墙命令与 CA 引导
+  $('fwCmdM').textContent = fwCmd;
+  $('pwshCmdM').textContent = pwshCmd;
+  $('copyFwM').onclick = () => {
+    navigator.clipboard.writeText(fwCmd).then(() => {
+      $('copyFwM').textContent = '已复制';
+      setTimeout(() => $('copyFwM').textContent = '复制防火墙放行命令', 1500);
+    });
+  };
+  $('copyPwshM').onclick = () => {
+    navigator.clipboard.writeText(pwshCmd).then(() => {
+      $('copyPwshM').textContent = '已复制';
+      setTimeout(() => $('copyPwshM').textContent = '复制一键命令', 1500);
+    });
+  };
+}
+
+// 分享地址列表：本机（S1）+ 各互联主机（全局编号与卡片/拓扑一致），单个或全部复制
+function buildShareUrls() {
+  const list = [];
+  const seenUrls = new Set();
+  const seq = {};
+  [nodeId, ...netNodes.map(n => n.id)].sort().forEach((nid, i) => { seq[nid] = i + 1; });
+  addrList.forEach(a => {
+    const url = `https://[${a}]:${port}`;
+    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + (seq[nodeId] || 1) + '（本机）', url }); }
+  });
+  netNodes.forEach(n => {
+    const url = 'https://' + (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+    if (url && !seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + (seq[n.id] || '?'), url }); }
+  });
+  return list;
+}
+
+function renderShareList() {
+  const list = buildShareUrls();
+  if (!list.length) list.push({ label: 'S1（本机）', url: location.origin }); // 兜底：无地址列表时复制当前页面
+  const el = $('shareList');
+  el.innerHTML = list.map(x => `
+    <div class="netItem"><span class="netDot" style="background:#2a9d8f"></span><b>${escapeHtml(x.label)}</b>
+      <code>${escapeHtml(x.url)}</code><button class="btn mini" data-copy="${escapeHtml(x.url)}">复制</button></div>`).join('')
+    || '<div style="font-size:12px;color:#8fa3c4">暂无可用地址</div>';
+  el.querySelectorAll('[data-copy]').forEach(b => {
+    b.onclick = () => {
+      const u = b.dataset.copy;
+      const done = () => { b.textContent = '已复制'; setTimeout(() => b.textContent = '复制', 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(u).then(done).catch(() => fallbackCopy(u, done));
+      else fallbackCopy(u, done);
+    };
+  });
+  $('shareCopyAll').onclick = () => {
+    const txt = [...new Set(list.map(x => x.url))].join('\n');
+    const done = () => { $('shareCopyAll').textContent = '已复制'; setTimeout(() => $('shareCopyAll').textContent = '复制全部', 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done).catch(() => fallbackCopy(txt, done));
+    else fallbackCopy(txt, done);
+  };
+}
+
+// 多主机自动互联：页面地址自带对方 IPv6（location.origin），本机若运行服务则自动连入该节点
+// 本机端口约定 7553（默认端口；自定义 -port 时自动失败，可用组网弹窗手动互联）
+function autoJoinLocal() {
+  const hn = location.hostname.replace(/^\[|\]$/g, '');
+  if (hn === '127.0.0.1' || hn === '::1' || hn === 'localhost') return; // 本机自测页面：本机即当前节点
+  // 必须用 https（服务仅 TLS）+ localhost（Safari 混合内容豁免；跑服务的主机必然已装本机 CA）
+  fetch('https://localhost:7553/api/join', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ remote: location.origin }),
+  }).then(r => {
+    if (!r.ok) console.warn('自动互联失败：', r.status, r.statusText);
+  }).catch(e => console.warn('自动互联失败：', e.message)); // 本机无服务/被拦截：仅诊断日志
+}
+
+// 延迟角标：颜色分级（≤50 绿 / ≤150 黄 / >150 红；无数据 —）
+function setRttBadge(el, rtt) {
+  if (rtt == null || rtt <= 0) { el.textContent = '—'; el.style.color = ''; return; }
+  el.textContent = rtt + 'ms';
+  el.style.color = rtt <= 50 ? '#4ade80' : (rtt <= 150 ? '#fbbf24' : '#f87171');
+}
+
+// 手动互联地址归一化：http→https、IPv6 补方括号、无端口补本机端口、去斜杠
+function normJoinRemote(raw) {
+  let s = (raw || '').trim();
+  if (!s) return '';
+  s = s.replace(/^http:\/\//i, 'https://');
+  if (!/^https:\/\//i.test(s)) s = 'https://' + s;
+  // IPv6 无方括号：先试整串作为合法 IPv6 地址（无端口）；失败再拆最后数字段作端口
+  const m = s.match(/^https:\/\/([^/?#]+)/i);
+  if (m) {
+    let host = m[1];
+    if (!host.startsWith('[') && (host.match(/:/g) || []).length >= 2) {
+      const full = '[' + host + ']';
+      try { new URL('https://' + full); host = full; }
+      catch (e2) {
+        const parts = host.split(':');
+        const last = parts[parts.length - 1];
+        if (/^\d+$/.test(last) && last.length <= 5 && Number(last) < 65536) {
+          const joined = '[' + parts.slice(0, -1).join(':') + ']';
+          try { new URL('https://' + joined); host = joined + ':' + last; } catch (e3) {}
+        }
+      }
+      s = 'https://' + host + s.slice(m[0].length);
+    }
+  }
+  try {
+    const u = new URL(s);
+    if (!u.port) u.port = String(port || 7553); // 无端口补本节点端口
+    return u.origin; // 去尾部斜杠
+  } catch (e) {
+    return '';
+  }
+}
+
+// 拓扑弹窗周期刷新（5s）：拉取最新节点/矩阵 + 真实测量各主机延迟
+function startTopoRefresh() {
+  if (topoTimer) return;
+  topoTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/addrs');
+      const d = await r.json();
+      nodeId = d.nodeId || nodeId;
+      myHostName = d.myHostName || '';
+      netNodes = d.nodes || [];
+      netTopo = d.topo || {};
+      myUsers = d.myUsers || [];
+      netLinkRtt = d.linkRtts || {};
+    } catch (e) {}
+    await measureHostRtts();
+    renderNetTopo();
+  }, 5000);
+}
+function stopTopoRefresh() {
+  if (topoTimer) { clearInterval(topoTimer); topoTimer = null; }
+}
+
+// 真实测量自己的浏览器到各互联主机的延迟（fetch /api/ping，3s 超时；每 5s 刷新）
+async function measureHostRtts() {
+  for (const n of netNodes) {
+    if (!n.remote) continue;
+    const url = 'https://' + (n.remote.startsWith('http') ? n.remote.replace(/^https?:\/\//, '') : n.remote);
+    const t0 = Date.now();
+    try {
+      const ctl = new AbortController();
+      const tm = setTimeout(() => ctl.abort(), 3000);
+      const r = await fetch(url + '/api/ping', { cache: 'no-store', mode: 'cors', signal: ctl.signal });
+      clearTimeout(tm);
+      if (r.ok) hostRtts[n.id] = Date.now() - t0; // 失败保留旧值
+    } catch (e) {}
+  }
+}
+
+// 用户到各互联主机的延迟列表（自己真实测量，他人近似 = 母节点延迟 + 节点间延迟）
+function userHostRttList(u, isSelf, hostId) {
+  const list = [];
+  const base = isSelf ? myRtt : (peers.get(u.id) ? peers.get(u.id).rtt : 0);
+  const targets = [nodeId, ...netNodes.map(x => x.id)].filter(x => x && x !== hostId);
+  for (const x of targets) {
+    let ms = 0;
+    if (isSelf) {
+      ms = hostRtts[x] || 0; // 真实测量
+    } else {
+      const link = (netLinkRtt[hostId] || {})[x] || 0; // 节点间延迟矩阵
+      ms = base > 0 && link > 0 ? base + link : 0;
+    }
+    if (ms > 0) list.push({ id: x, ms });
+  }
+  return list;
+}
+
+// 拓扑图拖动平移（内容放不下时拖动查看；触摸/鼠标均支持）
+function bindTopoPan() {
+  const wrap = $('netTopoWrap');
+  const svg = $('netTopo');
+  if (!wrap || !svg) return;
+  svg.addEventListener('pointerdown', e => {
+    panState.on = true; panState.moved = false;
+    panState.sx = e.clientX; panState.sy = e.clientY;
+    panState.ox = topoVB ? topoVB.x : 0;
+    panState.oy = topoVB ? topoVB.y : 0;
+    try { svg.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  svg.addEventListener('pointermove', e => {
+    if (!panState.on) return;
+    const dx = e.clientX - panState.sx, dy = e.clientY - panState.sy;
+    if (Math.abs(dx) + Math.abs(dy) > 6) panState.moved = true;
+    const vb = svg.viewBox.baseVal;
+    const kx = svg.clientWidth ? vb.width / svg.clientWidth : 1;
+    const ky = svg.clientHeight ? vb.height / svg.clientHeight : 1;
+    if (topoVB) {
+      topoVB.x = panState.ox - dx * kx;
+      topoVB.y = panState.oy - dy * ky;
+    }
+    vb.x = topoVB ? topoVB.x : 0;
+    vb.y = topoVB ? topoVB.y : 0;
+    if (panState.moved) wrap.classList.add('dragging');
+  });
+  const end = () => { panState.on = false; wrap.classList.remove('dragging'); };
+  svg.addEventListener('pointerup', end);
+  svg.addEventListener('pointercancel', end);
+  // 拖动结束抑制 click（避免误触选中/取消）
+  svg.addEventListener('click', e => {
+    if (panState.moved) { e.stopPropagation(); e.preventDefault(); panState.moved = false; }
+  }, true);
+  // 双击恢复默认视图
+  svg.addEventListener('dblclick', () => { topoVB = null; renderNetTopo(); });
+}
+
+// 关于弹窗：版本/服务器启动与运行时长/页面时长/缓存时间/日志模式/刷新状态
+function fmtDurMs(ms) {
+  if (!ms || ms <= 0) return '-';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return `${d}天 ${h}小时 ${m}分`;
+  if (h > 0) return `${h}小时 ${m}分`;
+  if (m > 0) return `${m}分 ${sec}秒`;
+  return `${sec}秒`;
+}
+function renderAbout() {
+  $('aboutVer').textContent = appVer;
+  $('aboutStart').textContent = serverStart ? new Date(serverStart).toLocaleString() : '-';
+  const wsOpen = ws && ws.readyState === WebSocket.OPEN;
+  // 服务器已运行：仅连接正常时计算（断开时不再虚增，重连后 refreshServerState 更新 serverStart 恢复准确）
+  $('aboutUptime').textContent = wsOpen && serverStart ? fmtDurMs(Date.now() - serverStart) : '连接断开中';
+  $('aboutPageUp').textContent = fmtDurMs(Date.now() - pageStartTs);
+  let cacheTxt = '-';
+  try {
+    const nc = JSON.parse(localStorage.getItem('teashare_nodes') || 'null');
+    if (nc && nc.at) cacheTxt = new Date(nc.at).toLocaleString();
+  } catch (e) {}
+  $('aboutCache').textContent = cacheTxt;
+  // 主机网络检测（服务器所在电脑的 IPv6/IPv4 状态，refreshServerState 从 /addrs 获取）
+  const v6 = ipv6Info || {};
+  const v6Addrs = (v6.localAddrs && v6.localAddrs.length) ? v6.localAddrs.join(', ') : '无（对方将无法通过 IPv6 访问）';
+  $('aboutIpv6Addrs').textContent = v6Addrs;
+  $('aboutIpv6Route').innerHTML = v6.route ? '<span class="ok">可用（可出站）</span>' : '<span class="warn">不可用</span>';
+  $('aboutIpv6Public').innerHTML = v6.public
+    ? `<span class="ok">可达</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
+    : '<span class="warn">不可达</span>';
+  $('aboutIpv6Public4').textContent = v6.publicIPv4 || '不可达';
+  // 服务器重启状态（refreshServerState 检测；断开重连期间也能感知）
+  $('aboutRefresh').hidden = !serverRestarted;
+  if (!aboutTimer) aboutTimer = setInterval(renderAbout, 1000);
+}
+function stopAboutTimer() {
+  if (aboutTimer) { clearInterval(aboutTimer); aboutTimer = null; }
+}
+
+// 互联拓扑图（星图风格）：金色主机环形排布 + 主机间金色连线 + 子用户星点扇形连线挂载
+function renderNetTopo() {
+  const svg = $('netTopo');
+  const act = $('netAction');
+  if (!svg) return;
+  const W = 560, H = 340, cx = W / 2, cy = H / 2;
+  const GOLD = '#fbbf24';
+  const selfId = nodeId || 'self'; // nodeId 缺失兜底：仍渲染本节点圆
+  const ids = [];
+  const addrOf = {};
+  const usersOf = {};
+  if (selfId) {
+    ids.push(selfId);
+    addrOf[selfId] = location.origin;
+    // 自己的用户点：host（服务运行者）由主机圆代表不单独显示；纯浏览用户需显示并高亮自己
+    usersOf[selfId] = myUsers.filter(u => !(myIsHost && u.id === myId));
+  }
+  netNodes.forEach(n => {
+    ids.push(n.id);
+    addrOf[n.id] = (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+    usersOf[n.id] = (n.users || []).filter(u => u.id !== myId);
+  });
+  if (ids.length <= 1 && !myUsers.length) {
+    svg.innerHTML = `<text x="${cx}" y="${cy}" text-anchor="middle" fill="#8fa3c4" font-size="13">暂无节点信息</text>`;
+    act.innerHTML = '';
+    return;
+  }
+  const R = Math.min(90, 44 + ids.length * 12); // 主机环形半径
+  const hostR = 30; // 主机圆半径
+  const nodeSeq = {};
+  [...ids].sort().forEach((nid, i) => { nodeSeq[nid] = i + 1; }); // 全局编号 S1、S2…（与卡片徽章一致）
+  const pos = {};
+  ids.forEach((id, i) => {
+    const a = (2 * Math.PI * i) / ids.length + Math.PI; // 起点在左侧（2 台主机时为左右分布）
+    pos[id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a), a };
+  });
+  // 主机间连线（金色，去重）+ 延迟标签防重叠放置（沿连线参数化 + 碰撞避让）
+  const seen = new Set();
+  const lines = [];
+  for (const [id, nbs] of Object.entries(netTopo)) {
+    for (const nb of nbs) {
+      if (!pos[id] || !pos[nb]) continue;
+      const key = id < nb ? id + '|' + nb : nb + '|' + id;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      // 直连延迟：本节点侧优先（nodes.rtt），否则用矩阵（他人视角）
+      let lr = 0;
+      if (id === selfId) lr = (netNodes.find(x => x.id === nb) || {}).rtt || 0;
+      else if (nb === selfId) lr = (netNodes.find(x => x.id === id) || {}).rtt || 0;
+      else lr = (netLinkRtt[id] || {})[nb] || 0;
+      lines.push({ x1: pos[id].x, y1: pos[id].y, x2: pos[nb].x, y2: pos[nb].y, lr });
+    }
+  }
+  const links = lines.map(l => `<line class="topoLink" x1="${l.x1}" y1="${l.y1}" x2="${l.x2}" y2="${l.y2}"/>`);
+  // 延迟标签：沿连线 t∈[0.3,0.7] 扫描避让（标签/主机圆），失败则沿法线错开，最终兜底中点
+  const labelRects = [];
+  const rect = (x, y, w, h) => ({ x: x - w / 2, y: y - h / 2, w, h });
+  const collide = r => labelRects.some(o => r.x < o.x + o.w && r.x + r.w > o.x && r.y < o.y + o.h && r.y + r.h > o.y);
+  lines.forEach(l => {
+    if (l.lr <= 0) return;
+    const txt = l.lr + 'ms';
+    const w = txt.length * 6 + 8, h = 12;
+    const dx = l.x2 - l.x1, dy = l.y2 - l.y1;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len, uy = dy / len;
+    let placed = false;
+    for (let i = 0; i < 16 && !placed; i++) {
+      const t = 0.3 + i * (0.4 / 15);
+      const px = l.x1 + dx * t, py = l.y1 + dy * t;
+      let onHost = false;
+      for (const hp of Object.values(pos)) {
+        if (Math.hypot(px - hp.x, py - hp.y) < hostR + h / 2 + 2) { onHost = true; break; }
+      }
+      const r = rect(px, py + 3, w, h);
+      if (!onHost && !collide(r)) {
+        links.push(`<text x="${px}" y="${py + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
+        labelRects.push(r);
+        placed = true;
+      }
+    }
+    if (!placed) { // 沿法线错开（兜底）
+      const nx = -uy, ny = ux;
+      for (let off = 4; off <= 16 && !placed; off += 4) {
+        for (const s of [1, -1]) {
+          const px = (l.x1 + l.x2) / 2 + nx * off * s, py = (l.y1 + l.y2) / 2 + ny * off * s;
+          const r = rect(px, py + 3, w, h);
+          if (!collide(r)) {
+            links.push(`<text x="${px}" y="${py + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
+            labelRects.push(r);
+            placed = true;
+          }
+        }
+      }
+    }
+    if (!placed) { // 最终兜底：中点（重叠可接受）
+      links.push(`<text x="${(l.x1 + l.x2) / 2}" y="${(l.y1 + l.y2) / 2 + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
+    }
+  });
+  // 主机节点 + 全部子用户星点（多层扇形辐射，细线连到主机，点居中于标签正下方）
+  const perLayer = 4;
+  const out = [];
+  // 收集子用户（位置 + 标签文本）
+  const userItems = [];
+  ids.forEach(id => {
+    const p = pos[id];
+    const isSelf = id === selfId;
+    const allUsers = usersOf[id] || [];
+    allUsers.forEach((u, j) => {
+      const layer = Math.floor(j / perLayer);
+      const inLayer = j % perLayer;
+      const m = Math.min(perLayer, allUsers.length - layer * perLayer);
+      const spread = m > 1 ? (inLayer / (m - 1) - 0.5) * (Math.PI * 110 / 180) : 0;
+      const ang = p.a + spread;
+      const dist = hostR + 46 + layer * 26;
+      const ux = p.x + dist * Math.cos(ang);
+      const uy = p.y + dist * Math.sin(ang);
+      const rtt = u.id === myId ? myRtt : (peers.get(u.id) ? peers.get(u.id).rtt : 0); // 自己的延迟存于 myRtt（peers 不含自己）
+      const isMe = isSelf && u.id === myId;
+      // 到所有其他主机的延迟：自己真实测量，他人近似（母节点延迟 + 节点间延迟矩阵）
+      const hostDl = userHostRttList(u, isMe, id).map(t => `| ${t.id.slice(0, 4)} ${t.ms}ms`).join(' ');
+      const label = `${escapeHtml((u.name || u.id).slice(0, isMe ? 6 : 8))}${isMe ? '（我）' : ''} ${rtt > 0 ? rtt + 'ms' : '—'}${hostDl ? ' ' + hostDl : ''}`;
+      userItems.push({ u, ux, uy, ang, label, isMe, rtt, isSelf, hostX: p.x, hostY: p.y });
+    });
+  });
+  // 标签碰撞放置：点正上方/下方居中 + 径向距离递增；检测连线延迟标签/主机圆/其他用户点（不检测连线）
+  const placedUserPts = [];
+  const rectOf = (x, y, w, h) => ({ x: x - w / 2, y: y - h / 2, w, h });
+  const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  const vsCircle = (r, cx, cy, cr) => {
+    const nx = Math.max(r.x, Math.min(cx, r.x + r.w));
+    const ny = Math.max(r.y, Math.min(cy, r.y + r.h));
+    return Math.hypot(cx - nx, cy - ny) < cr;
+  };
+  userItems.forEach(it => {
+    const w = it.label.length * 6.2 + 8, h = 14;
+    let best = null, bestScore = Infinity;
+    for (let di = 0; di <= 2; di++) {
+      const d = di * 10;
+      const px = it.ux + Math.cos(it.ang) * d;
+      const py = it.uy + Math.sin(it.ang) * d;
+      for (const up of [true, false]) {
+        const r = rectOf(px, py, w, h);
+        r.y = up ? py - 18 - h / 2 : py + 24 - h / 2;
+        let score = 0;
+        for (const hp of Object.values(pos)) if (vsCircle(r, hp.x, hp.y, hostR + 2)) score += 100;
+        for (const o of labelRects) if (overlap(r, o)) score += 100;
+        for (const op of placedUserPts) if (vsCircle(r, op.x, op.y, 10)) score += 100;
+        if (score < bestScore) { bestScore = score; best = { px, py, up, r }; }
+      }
+    }
+    it.px = best.px; it.py = best.py; it.up = best.up; it.r = best.r;
+    labelRects.push(best.r);
+    placedUserPts.push({ x: it.ux, y: it.uy });
+  });
+  // 动态 viewBox 自适应：最大内容半径 + 标签包围盒（长标签不裁切）
+  let maxContent = R + hostR + 46;
+  for (const id of ids) {
+    const layers = Math.max(1, Math.ceil((usersOf[id] || []).length / perLayer));
+    const mr = R + hostR + 46 + (layers - 1) * 26;
+    if (mr > maxContent) maxContent = mr;
+  }
+  userItems.forEach(it => {
+    const r = it.r;
+    const extent = Math.hypot(Math.max(Math.abs(r.x), Math.abs(r.x + r.w)), Math.max(Math.abs(r.y), Math.abs(r.y + r.h)));
+    if (extent > maxContent) maxContent = extent;
+  });
+  const vbW = Math.max(560, Math.ceil(maxContent * 2 + 80));
+  const vbH = Math.round(vbW * 340 / 560);
+  // 节点组成/画布尺寸变化时重置视图；否则保持用户平移/双击恢复后的视图
+  if (!topoVB || topoVB.ids !== ids.join(',') || topoVB.w !== vbW) {
+    topoVB = { ids: ids.join(','), x: 0, y: 0, w: vbW, h: vbH };
+  }
+  svg.setAttribute('viewBox', `${topoVB.x} ${topoVB.y} ${topoVB.w} ${topoVB.h}`);
+  // 渲染子用户（连线 + 点 + 居中标签）
+  userItems.forEach(it => {
+    out.push(`<line class="userLink" x1="${it.hostX + hostR * Math.cos(it.ang)}" y1="${it.hostY + hostR * Math.sin(it.ang)}" x2="${it.ux}" y2="${it.uy}"/>`);
+    out.push(`<g class="topoUser${it.isMe ? ' self' : ''}">${it.isMe ? '<circle class="glow" cx="' + it.ux + '" cy="' + it.uy + '" r="13"/>' : ''}<circle cx="${it.ux}" cy="${it.uy}" r="8"/>
+      <title>${escapeHtml(it.u.name || it.u.id)}（${it.rtt > 0 ? it.rtt + 'ms' : '—'}）${it.isMe ? '（我）' : ''}</title></g>
+      <text x="${it.px}" y="${it.r.y + 11}" font-size="10" fill="#e2e8f0" text-anchor="middle" pointer-events="none">${it.label}</text>`);
+  });
+  // 主机圆（金色，本节点加光晕；圆内标注全局序号 S{n} + 标识，延迟入 title）
+  ids.forEach(id => {
+    const p = pos[id];
+    const isSelf = id === selfId;
+    const allUsers = usersOf[id] || [];
+    const sLabel = 'S' + (nodeSeq[id] || '?');
+    const idShort = isSelf ? (myHostName || '主机').slice(0, 4) + ((myHostName || '').length > 4 ? '…' : '') : id.slice(0, 4);
+    // 圆内延迟：我→该主机的延迟（本节点 = myRtt 服务器实测；远端 = hostRtts 真实测量，未测到显示 —）
+    const hostDelay = isSelf ? myRtt : (hostRtts[id] || 0);
+    // 切换主机推荐：远端主机延迟显著优于当前主机（差值 >20ms）→ 标注「推荐」
+    const recTxt = (!isSelf && hostDelay > 0 && myRtt > 0 && hostDelay + 20 < myRtt)
+      ? '<text y="-44" font-size="9" fill="#4ade80" font-weight="700">推荐</text>' : '';
+    out.push(`<g class="topoNode${netSel === id ? ' sel' : ''}" data-node="${id}" transform="translate(${p.x},${p.y})">
+      ${recTxt}
+      ${isSelf ? '<circle r="42" fill="none" stroke="rgba(251,191,36,0.3)" stroke-width="2"/>' : ''}
+      <circle r="${hostR}" fill="rgba(251,191,36,0.16)" stroke="${GOLD}" stroke-width="2"/>
+      <text y="-11" font-size="12" font-weight="700">${escapeHtml(sLabel)}</text>
+      <text y="2" font-size="8" fill="#fde68a">${escapeHtml(idShort)}</text>
+      <text y="13" font-size="8" fill="#fde68a">${hostDelay > 0 ? hostDelay + 'ms' : '—'}</text>
+      <title>${isSelf ? '本节点 ' + (nodeId || myHostName || '主机') + '（' + allUsers.length + ' 用户）' + (myRtt > 0 ? '，延迟 ' + myRtt + 'ms' : '') : '主机 ' + sLabel + '：' + (addrOf[id] || '') + '（' + allUsers.length + ' 用户）' + (hostDelay > 0 ? '，延迟 ' + hostDelay + 'ms' : '') + (recTxt ? '，推荐切换' : '')}</title>
+    </g>`);
+  });
+  svg.innerHTML = links.join('') + out.join('');
+  svg.onclick = () => { netSel = null; renderNetTopo(); };
+  svg.querySelectorAll('.topoNode').forEach(g => {
+    g.onclick = e => {
+      e.stopPropagation();
+      netSel = g.dataset.node;
+      renderNetTopo();
+    };
+  });
+  // 操作栏：总览 + 选中远端主机 → 切换
+  const totalUsers = myUsers.length + netNodes.reduce((s, n) => s + (n.users ? n.users.length : 0), 0);
+  if (netSel && netSel !== selfId) {
+    const addr = addrOf[netSel] || '';
+    act.innerHTML = `已选主机 <b>${escapeHtml(netSel)}</b>（${escapeHtml(addr)}）<button class="btn primary" id="btnSwitchNode">切换到该主机</button>`;
+    const btn = $('btnSwitchNode');
+    if (btn) btn.onclick = () => window.open('https://' + addr, '_blank');
+  } else {
+    act.innerHTML = `<span style="font-size:12px;color:#8fa3c4">${netNodes.length} 台互联主机 · 在线用户 ${totalUsers} 人${netNodes.length ? '，点击主机可切换' : ''}</span>`;
+  }
+}
+</script>
+</body>
+</html>
+

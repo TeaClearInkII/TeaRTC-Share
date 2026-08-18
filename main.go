@@ -1,0 +1,2724 @@
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"embed"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	neturl "net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
+	"github.com/pion/turn/v4"
+	"github.com/pion/webrtc/v4"
+)
+
+//go:embed web/index.html
+var indexHTML embed.FS
+
+//go:embed icon.png
+var iconPNG []byte // 应用图标：exe（.syso 资源）+ favicon（/favicon.png）共用
+
+//go:embed trayicon.ico
+var trayIcon []byte // 托盘专用图标（Windows 托盘需 .ico 格式；裁剪放大+不透明底，16/32 双尺寸）
+
+const (
+	caOrg        = "TeaShare"
+	caCN         = "TeaShare Local CA"
+	caValidDays  = 3650
+	srvValidDays = 365
+	appVersion   = "0.1.0"
+)
+
+var verboseFlag atomic.Bool // 日志调试模式（-v 启动或运行时 /api/log-level 切换）
+
+// logV 调试日志：仅调试模式输出（高频细节日志，生产默认安静）
+func logV(format string, args ...any) {
+	if verboseFlag.Load() {
+		log.Printf(format, args...)
+	}
+}
+
+func main() {
+	port := flag.Int("port", 7553, "HTTPS 监听端口")
+	turnPort := flag.Int("turnport", 3478, "TURN 中继 TCP 端口")
+	verbose := flag.Bool("v", false, "调试日志（详细输出）")
+	flag.Parse()
+	verboseFlag.Store(*verbose)
+
+	// 日志三路输出：控制台 + 文件（logs/teartcshare-YYYYMMDD.log，完整内容含启动失败/错误）+ WS 日志窗口。
+	// 必须最先设置，确保启动早期（IPv6 探测/证书初始化等）的日志也落盘
+	{
+		outs := []io.Writer{ignoreErrWriter{w: os.Stderr}, logSinkInst} // stderr 写失败不阻断文件/WS 日志（静默模式 FreeConsole 后 stderr 无效）
+		if lf := initLogFile(); lf != nil {
+			outs = append(outs, syncWriter{f: lf})
+		}
+		log.SetOutput(io.MultiWriter(outs...))
+	}
+	if cfg.SilentStart {
+		freeConsole() // 静默启动：分离控制台（无黑窗，日志走文件 + 前端日志窗口）
+	}
+
+	addrs := detectIPv6()
+	ipv6Info.LocalAddrs = addrs // 启动期同步设置（单线程，无需锁）
+	ipv6Info.Route = false
+	for _, dns := range v6DNS {
+		if probeUDP6(dns, 3*time.Second) {
+			ipv6Info.Route = true
+			break
+		}
+	}
+	go refreshPublicIP() // 公网可达性后台查询（离线不阻塞启动）
+
+	caPEM, err := ensureCerts("certs", addrs)
+	if err != nil {
+		log.Fatalf("证书初始化失败: %v", err)
+	}
+
+	h := newHub()
+	logSinkInst.attach(h) // 绑定 hub：启动早期日志已暂存，此后实时转发日志窗口
+
+	turnURL, turnUser, turnPass := "", "", ""
+	if len(addrs) > 0 {
+		if u, user, pass, err := startTURN(*turnPort, net.ParseIP(addrs[0])); err != nil {
+			log.Printf("TURN 中继启动失败（远程观看将无 TCP 兜底）: %v", err)
+		} else {
+			turnURL, turnUser, turnPass = u, user, pass
+		}
+	}
+	h.sfu.iceServers = buildICEServers(turnURL, turnUser, turnPass)
+	go h.chatFileCleanup() // 聊天文件过期清理
+	go h.rttProbe()        // 周期测量各用户到主机的延迟（卡片右上角角标）
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		data, err := indexHTML.ReadFile("web/index.html")
+		if err != nil {
+			http.Error(w, "page missing", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(data)
+	})
+	mux.HandleFunc("/favicon.png", func(w http.ResponseWriter, r *http.Request) { // 网页标签页图标
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(iconPNG)
+	})
+	mux.HandleFunc("/ws", h.serveWS)
+	mux.HandleFunc("/node-ws", h.serveNodeWS)
+	mux.HandleFunc("/api/join", h.handleJoin)
+	mux.HandleFunc("/api/join-token", h.handleJoinToken)
+	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "*"
+		}
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	})
+	mux.HandleFunc("/api/log-level", h.handleLogLevel)
+	mux.HandleFunc("/api/chat-file", h.handleChatFileUpload)
+	mux.HandleFunc("/api/chat-file/", h.handleChatFileGet)
+	mux.HandleFunc("/api/link-preview", h.handleLinkPreview)
+	mux.HandleFunc("/ca.crt", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
+		w.Header().Set("Content-Disposition", `attachment; filename="teashare-ca.crt"`)
+		w.Write(caPEM)
+	})
+	mux.HandleFunc("/addrs", func(w http.ResponseWriter, r *http.Request) {
+		ice := []map[string]any{}
+		if turnURL != "" {
+			ice = append(ice, map[string]any{
+				"urls":       []string{turnURL},
+				"username":   turnUser,
+				"credential": turnPass,
+			})
+		}
+		ipv6Mu.RLock()
+		ipv6 := ipv6Info
+		ipv6Mu.RUnlock()
+		json.NewEncoder(w).Encode(map[string]any{"addrs": addrs, "port": *port, "iceServers": ice, "nodeId": h.nodeId, "myHostName": h.myHostName(), "nodes": h.nodeInfoList(), "topo": h.topoSnapshot(), "myUsers": h.myUserList(), "linkRtts": h.linkRttSnapshot(), "version": appVersion, "serverStart": h.serverStart, "ipv6": ipv6})
+	})
+
+	srv := &http.Server{
+		Addr:              fmt.Sprintf("[::]:%d", *port),
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	tlsCert, err := tls.LoadX509KeyPair(filepath.Join("certs", "server.crt"), filepath.Join("certs", "server.key"))
+	if err != nil {
+		log.Fatalf("加载服务器证书失败: %v", err)
+	}
+	srv.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
+	}
+
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		log.Fatalf("监听 %s 失败: %v", srv.Addr, err)
+	}
+
+	log.Println("==============================================")
+	log.Println(" TeaRTC 屏幕共享服务已启动")
+	log.Println("----------------------------------------------")
+	if len(addrs) > 0 {
+		log.Println(" 观看地址（IPv6，发给对方用浏览器打开）:")
+		for _, a := range addrs {
+			log.Printf("   https://[%s]:%d", a, *port)
+		}
+		log.Printf(" IPv6 出站可用:  %v", boolTxt(ipv6Info.Route))
+		log.Println(" 公网 IPv6 检测:  后台进行中（可在页面「关于」查看主机网络状态）")
+	} else {
+		log.Println(" !! 未检测到可用的全局 IPv6 地址，请检查网络")
+	}
+	log.Printf(" 本机自测:      https://127.0.0.1:%d", *port)
+	log.Println(" CA 证书:       certs\\ca.crt （对方安装后访问无警告）")
+	log.Println("----------------------------------------------")
+	log.Printf(" 若对方连不上，请以管理员执行防火墙放行:\n   netsh advfirewall firewall add rule name=\"TeaShare-%d\" dir=in action=allow protocol=TCP localport=%d\n   netsh advfirewall firewall add rule name=\"TeaShare-turn-%d\" dir=in action=allow protocol=TCP localport=%d", *port, *port, *turnPort, *turnPort)
+	log.Println("   WebRTC 画面走随机 UDP 端口，还需允许浏览器（chrome.exe）通过防火墙（设置 → 防火墙 → 允许应用通过）")
+	if turnURL != "" {
+		log.Printf("   TURN 中继(远程 UDP 被丢时的 TCP 兜底): %s", turnURL)
+	} else {
+		log.Println("   TURN 中继不可用（无 IPv6 或端口被占用）")
+	}
+	log.Println("==============================================")
+
+	log.Printf("服务运行中: https://[::]:%d", *port)
+	go func() {
+		if err := srv.ServeTLS(ln, "", ""); err != nil {
+			log.Printf("HTTP 服务异常: %v", err)
+		}
+	}()
+	runTray(*port) // 系统托盘（阻塞；X 关闭控制台 → 隐藏驻留托盘，托盘「退出」才结束进程）
+}
+
+// ---------- IPv6 探测 ----------
+
+// 出站探测目标（公网 DNS，UDP connect 不发包、无风险）
+var v6DNS = []string{
+	"2606:4700:4700::1111", // Cloudflare
+	"2001:4860:4860::8888", // Google
+}
+
+// ipv6Status 主机 IPv6 检测结果（前端「关于」弹窗告知，注明为主机信息）
+type ipv6Status struct {
+	LocalAddrs []string `json:"localAddrs"` // 本机可用全局 IPv6 地址
+	Route      bool     `json:"route"`      // 出站源地址可用（UDP6 connect 成功）
+	Public     bool     `json:"public"`     // 公网 IPv6 可达
+	PublicIPv6 string   `json:"publicIPv6"` // 公网 IPv6 地址
+	PublicIPv4 string   `json:"publicIPv4"` // 公网 IPv4 地址
+}
+
+var (
+	ipv6Mu   sync.RWMutex
+	ipv6Info ipv6Status
+)
+
+// probeUDP6 UDP6 connect 出站探测（无包，等价 Python 源地址选择技巧；本机无 IPv6 直接报错）
+func probeUDP6(host string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("udp6", net.JoinHostPort(host, "80"), timeout)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// queryPublicIP 公网 IP 查询（强制 IPv6/IPv4 传输；依赖外部 API，离线时返回空）
+func queryPublicIP(ipv6 bool, timeout time.Duration) string {
+	network := "tcp4"
+	urls := []string{"https://api4.ipify.org", "https://4.ipw.cn/", "https://api.ip.sb/ip"}
+	if ipv6 {
+		network = "tcp6"
+		urls = []string{"https://api6.ipify.org", "https://6.ipw.cn/", "https://api-ipv6.ip.sb/ip"}
+	}
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: timeout}).DialContext(ctx, network, addr) // 强制 tcp6/tcp4，用实际地址（此前传空地址导致必然失败）
+		},
+	}
+	client := &http.Client{Timeout: timeout, Transport: tr}
+	for _, url := range urls {
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
+		s := strings.TrimSpace(string(b))
+		if isValidIP(s, ipv6) {
+			return s
+		}
+	}
+	return ""
+}
+
+// isValidIP 校验返回内容确实是目标类型的 IP（防 API 返回错误页/多余文本）
+func isValidIP(s string, ipv6 bool) bool {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return false
+	}
+	return ipv6 == (ip.To4() == nil)
+}
+
+// refreshPublicIP 后台刷新公网可达性（不阻塞启动；公网状态变化慢，启动时查一次即可）
+func refreshPublicIP() {
+	p6 := queryPublicIP(true, 5*time.Second)
+	p4 := queryPublicIP(false, 5*time.Second)
+	ipv6Mu.Lock()
+	ipv6Info.Public, ipv6Info.PublicIPv6 = p6 != "", p6
+	ipv6Info.PublicIPv4 = p4
+	ipv6Mu.Unlock()
+	log.Printf("ipv6: 公网 IPv6=%s（可达=%v） 公网 IPv4=%s", orDash(p6), p6 != "", orDash(p4))
+}
+
+func orDash(s string) string {
+	if s == "" {
+		return "-"
+	}
+	return s
+}
+
+func boolTxt(b bool) string {
+	if b {
+		return "可用"
+	}
+	return "不可用"
+}
+
+func detectIPv6() []string {
+	seen := make(map[string]bool)
+	var list []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("枚举网卡失败: %v", err)
+		return nil
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok || ipnet.IP.To4() != nil {
+				continue
+			}
+			ip := ipnet.IP
+			if !usableIPv6(ip) {
+				continue
+			}
+			s := ip.String()
+			if seen[s] {
+				continue
+			}
+			if ipv6SelfTest(ip) {
+				seen[s] = true
+				list = append(list, s)
+			}
+		}
+	}
+	sort.Strings(list)
+	return list
+}
+
+func usableIPv6(ip net.IP) bool {
+	if !ip.IsGlobalUnicast() {
+		return false
+	}
+	if ip.Equal(net.ParseIP("::1")) {
+		return false
+	}
+	if ip[0] == 0xfe && ip[1]&0xc0 == 0x80 { // fe80::/10 链路本地
+		return false
+	}
+	if ip[0] == 0xfc || ip[0] == 0xfd { // fc00::/7 ULA 不跨网路由
+		return false
+	}
+	if ip[0] == 0x20 && ip[1] == 0x01 {
+		if ip[2] == 0x0d && ip[3] == 0xb8 { // 2001:db8::/32 文档地址
+			return false
+		}
+		if ip[2] == 0 && ip[3] == 0 { // 2001::/32 Teredo
+			return false
+		}
+	}
+	if ip[0] == 0x20 && ip[1] == 0x02 { // 2002::/16 6to4
+		return false
+	}
+	return true
+}
+
+// ipv6SelfTest 在指定地址上监听 TCP 端口并回连自身，验证地址真实可用（可绑定、协议栈就绪）
+func ipv6SelfTest(ip net.IP) bool {
+	ln, err := net.ListenTCP("tcp6", &net.TCPAddr{IP: ip, Port: 0})
+	if err != nil {
+		return false
+	}
+	defer ln.Close()
+	addr := ln.Addr().(*net.TCPAddr)
+	conn, err := net.DialTimeout("tcp6", net.JoinHostPort(ip.String(), fmt.Sprint(addr.Port)), 2*time.Second)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// ---------- 证书 ----------
+
+func ensureCerts(dir string, addrs []string) ([]byte, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	caKey, caCert, err := loadOrCreateCA(filepath.Join(dir, "ca.key"), filepath.Join(dir, "ca.crt"))
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureServerCert(filepath.Join(dir, "server.key"), filepath.Join(dir, "server.crt"), caKey, caCert, addrs); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(filepath.Join(dir, "ca.crt"))
+}
+
+func loadOrCreateCA(keyPath, certPath string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
+	if key, cert, err := loadKeyPair(keyPath, certPath); err == nil {
+		return key, cert, nil
+	}
+	log.Println("未找到本地 CA，正在生成新的 CA 与证书（有效期 10 年，持久保存在 certs/）...")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(time.Now().UnixNano()),
+		Subject:               pkix.Name{CommonName: caCN, Organization: []string{caOrg}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(caValidDays, 0, 0),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return nil, nil, err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return nil, nil, err
+	}
+	return key, cert, saveKeyPair(keyPath, certPath, key, cert)
+}
+
+func ensureServerCert(keyPath, certPath string, caKey *ecdsa.PrivateKey, caCert *x509.Certificate, addrs []string) error {
+	if _, cert, err := loadKeyPair(keyPath, certPath); err == nil {
+		if time.Now().Before(cert.NotAfter.Add(-24*time.Hour)) && sanCovers(cert, addrs) {
+			return nil
+		}
+	}
+	log.Println("生成服务器证书（SAN 覆盖全部 IPv6 地址）...")
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	ips := []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	for _, a := range addrs {
+		if ip := net.ParseIP(strings.TrimPrefix(a, "[")); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject:      pkix.Name{CommonName: "teashare.local", Organization: []string{caOrg}},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().AddDate(srvValidDays, 0, 0),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IPAddresses:  ips,
+		DNSNames:     []string{"localhost", "teashare.local"},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
+	if err != nil {
+		return err
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		return err
+	}
+	return saveKeyPair(keyPath, certPath, key, cert)
+}
+
+func sanCovers(cert *x509.Certificate, addrs []string) bool {
+	for _, a := range addrs {
+		ip := net.ParseIP(a)
+		found := false
+		for _, cip := range cert.IPAddresses {
+			if cip.Equal(ip) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func saveKeyPair(keyPath, certPath string, key *ecdsa.PrivateKey, cert *x509.Certificate) error {
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		return err
+	}
+	return os.WriteFile(certPath, certPEM, 0o644)
+}
+
+func loadKeyPair(keyPath, certPath string) (*ecdsa.PrivateKey, *x509.Certificate, error) {
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, nil, fmt.Errorf("无效的私钥文件: %s", keyPath)
+	}
+	key, err := x509.ParseECPrivateKey(block.Bytes)
+	if err != nil {
+		return nil, nil, err
+	}
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	cb, _ := pem.Decode(certPEM)
+	if cb == nil {
+		return nil, nil, fmt.Errorf("无效的证书文件: %s", certPath)
+	}
+	cert, err := x509.ParseCertificate(cb.Bytes)
+	return key, cert, err
+}
+
+// ---------- TURN 中继 ----------
+
+func randomCred(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}
+
+// ipv6RelayGen 是 pion/turn 的 RelayAddressGenerator 实现。
+// pion/turn 对 TCP listener 的 allocation 内部使用 "udp4" 网络，
+// 无法绑定 IPv6 中继地址（导致 "no suitable address found"），
+// 因此忽略其 network 参数，强制用 "udp" 绑定到指定的 IPv6 地址。
+type ipv6RelayGen struct {
+	relayIP net.IP
+}
+
+func (g *ipv6RelayGen) Validate() error {
+	if g.relayIP == nil {
+		return fmt.Errorf("relay ip required")
+	}
+	return nil
+}
+
+func (g *ipv6RelayGen) AllocatePacketConn(_ string, requestedPort int) (net.PacketConn, net.Addr, error) {
+	conn, err := net.ListenPacket("udp", fmt.Sprintf("[%s]:%d", g.relayIP, requestedPort))
+	if err != nil {
+		return nil, nil, err
+	}
+	relayAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		conn.Close()
+		return nil, nil, fmt.Errorf("not a udp address")
+	}
+	relayAddr.IP = g.relayIP
+	return conn, relayAddr, nil
+}
+
+func (g *ipv6RelayGen) AllocateConn(string, int) (net.Conn, net.Addr, error) {
+	return nil, nil, fmt.Errorf("tcp relay unsupported")
+}
+
+// startTURN 启动 TURN over TCP 中继：远程观看者的 UDP 被运营商/光猫丢弃时，
+// WebRTC 自动改走 TCP 经本服务器中继（浏览器 ⇄ 服务器为 TCP，服务器 ⇄ 共享者为本地 UDP）
+// 凭据持久化到 certs/turn-cred.json：重启复用，旧页面持有的凭据不失效
+func startTURN(port int, relayIP net.IP) (url, username, password string, err error) {
+	credPath := filepath.Join("certs", "turn-cred.json")
+	data, rerr := os.ReadFile(credPath)
+	if rerr == nil {
+		var saved struct {
+			User string `json:"user"`
+			Pass string `json:"pass"`
+		}
+		if json.Unmarshal(data, &saved) == nil && saved.User != "" && saved.Pass != "" {
+			username, password = saved.User, saved.Pass
+		}
+	}
+	if username == "" || password == "" {
+		username = randomCred(4)
+		password = randomCred(6)
+		if wdata, werr := json.Marshal(map[string]string{"user": username, "pass": password}); werr == nil {
+			_ = os.MkdirAll("certs", 0o755)
+			_ = os.WriteFile(credPath, wdata, 0o600)
+		}
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("[::]:%d", port))
+	if err != nil {
+		return "", "", "", err
+	}
+	srv, err := turn.NewServer(turn.ServerConfig{
+		Realm: "teashare",
+		AuthHandler: func(u, realm string, src net.Addr) ([]byte, bool) {
+			if u == username {
+				return turn.GenerateAuthKey(u, realm, password), true
+			}
+			return nil, false
+		},
+		EventHandler: turn.EventHandler{
+			OnAuth: func(srcAddr, dstAddr net.Addr, protocol, u, realm, method string, verdict bool) {
+				logV("TURN: 认证 %s 方法=%s 结果=%v 来源=%v", u, method, verdict, srcAddr)
+			},
+			OnAllocationCreated: func(srcAddr, dstAddr net.Addr, protocol, u, realm string, relayAddr net.Addr, requestedPort int) {
+				log.Printf("TURN: 中继分配 %v → %v (用户 %s)", srcAddr, relayAddr, u)
+			},
+			OnAllocationError: func(srcAddr, dstAddr net.Addr, protocol, message string) {
+				log.Printf("TURN: 分配错误 来源=%v %s", srcAddr, message)
+			},
+		},
+		ListenerConfigs: []turn.ListenerConfig{{
+			Listener: ln,
+			RelayAddressGenerator: &ipv6RelayGen{
+				relayIP: relayIP,
+			},
+		}},
+	})
+	if err != nil {
+		ln.Close()
+		return "", "", "", err
+	}
+	_ = srv
+	return fmt.Sprintf("turn:[%s]:%d?transport=tcp", relayIP, port), username, password, nil
+}
+
+// ---------- WebSocket 信令（对等模型）与 SFU ----------
+
+var palette = []string{"#e63946", "#f4a261", "#2a9d8f", "#457b9d", "#9b5de5", "#f15bb5", "#00bbf9", "#00f5d4", "#ffd166", "#06d6a0", "#7209b7", "#3a86ff"}
+
+type hub struct {
+	mu         sync.Mutex
+	peers      map[string]*peer
+	clientIDs  map[string]*peer // clientId -> peer（刷新/重连沿用身份）
+	sfu        *SFU
+	seq        int
+	streamCfgs map[string]map[string]any // streamId -> 共享者最新配置
+
+	chatHist   []map[string]any     // 聊天历史（最近 100 条，重启清空；新成员可见）
+	chatFiles  map[string]*chatFile // 聊天文件缓存（内存，重启清空，过期清理）
+	chatTotalB int                  // 聊天文件总字节（超上限时清理最旧）
+
+	// 多主机互联（二期）：mesh 全互联，任意主机连接另一主机即自动互联
+	nodeId        string                      // 本节点随机 id
+	serverStart   int64                       // 服务器启动时间戳（unix ms，前端刷新判断用）
+	nodes         map[string]*nodeLink        // 邻居节点 id -> 连接
+	topo          map[string][]string         // 全局拓扑：节点 id -> 邻居 id 列表（含本节点，mesh 全同步）
+	linkRtt       map[string]map[string]int64 // 节点间延迟矩阵：节点 id -> 其各邻居直连延迟（近似计算用）
+	joinTokens    map[string]time.Time        // 一次性 join token（/node-ws 校验）
+	forwardTokens map[string]string           // 再互联凭证（token -> 绑定的邻居节点 id，mesh 自动扩展用）
+	fileRoute     map[string]string           // 跨节点 fileId -> 源节点 id（下载代理路由）
+	fileBuf       map[string][]byte           // 跨节点文件分片组装缓冲
+	fileWait      map[string][]chan *chatFile
+	linkPending   map[string]bool // 连接中（防并发重复建立）
+
+	// 远程控制会话（P2-2）：targetOwnerID -> 控制权
+	ctrlMu     sync.Mutex
+	ctrlReqs   map[string]*ctrlReq // 待被控端确认的请求（targetOwnerID -> 请求）
+	ctrlActive map[string]*ctrlReq // 已授权会话（targetOwnerID -> 控制器）
+
+	// 日志窗口：环形缓冲 + 订阅连接（logsink.go）
+	logBufMu sync.Mutex
+	logBuf   []string        // 最近日志（环形，上限 logBufMax）
+	logSubs  map[string]bool // peer id -> 已订阅（日志窗口打开中）
+}
+
+// ctrlReq 远程控制请求/会话
+type ctrlReq struct {
+	controllerID   string
+	controllerName string
+	at             time.Time
+}
+
+// chatFile 聊天上传的文件（内存缓存）
+type chatFile struct {
+	data []byte
+	mime string
+	name string
+	at   time.Time
+	big  bool // 大文件（> 阈值）：按时间过期清理；小文件随聊天历史上限清理
+}
+
+type SFU struct {
+	hub        *hub
+	mu         sync.Mutex
+	streams    map[string]*stream // streamID(=ownerID) -> stream
+	viewers    map[string]*viewerConn
+	iceServers []webrtc.ICEServer
+}
+
+type peer struct {
+	hub    *hub
+	id     string
+	name   string
+	color  string
+	conn   *websocket.Conn
+	send   chan []byte
+	closed bool
+
+	clientID  string // 浏览器持久身份（刷新/重连沿用）
+	replaced  bool   // 已被新连接顶替（unregister 时跳过广播）
+	host      bool   // 服务器主机（本机运行的浏览器，标记"服务器主机"徽章）
+	ip        string // 连接来源 IP（RemoteAddr，供观看端展示）
+	enterHost string // 进入页面的 URL 主机（前端 location.hostname 上报，供观看端展示服务地址）
+	hostId    string // 所属节点的服务运行者 peer id（多节点互联：该用户所在节点的服务用户）
+	rttMs     int64  // 该用户到其所在主机的延迟（服务器 ping 测量，peer.mu 保护）
+	lastPong  int64  // 最近一次收到 pong 的时间戳（死连接探测，peer.mu 保护）
+
+	mu          sync.Mutex
+	pubPC       *webrtc.PeerConnection            // 屏幕/视频推流连接
+	camPC       *webrtc.PeerConnection            // 摄像头推流连接（独立流，流 id = ownerID-cam）
+	audioPubPCs map[string]*webrtc.PeerConnection // 音频推流连接（kind: mic/system，可共存）
+}
+
+type stream struct {
+	ID           string
+	OwnerID      string
+	SourcePC     *webrtc.PeerConnection
+	Codec        webrtc.RTPCodecCapability
+	Layers       map[string]*rewriteTrack       // rid(l/m/h) -> local（视频 simulcast）
+	Remote       map[string]*webrtc.TrackRemote // rid -> remote（视频）
+	AudioTracks  map[string]*rewriteTrack       // 音频通道(kind: mic/system) -> local（可共存）
+	AudioRemotes map[string]*webrtc.TrackRemote // kind -> remote
+}
+
+type viewerConn struct {
+	peer        *peer
+	pc          *webrtc.PeerConnection
+	senders     map[string]*webrtc.RTPSender // streamID -> video sender
+	audioSender map[string]*webrtc.RTPSender // streamID -> audio sender
+	tiers       map[string]string            // streamID -> rid
+	negCh       chan struct{}
+	pmu         sync.Mutex
+	pending     bool // 有在途 offer 未 answer 时标记待协商
+}
+
+func buildICEServers(turnURL, user, pass string) []webrtc.ICEServer {
+	if turnURL == "" {
+		return nil
+	}
+	return []webrtc.ICEServer{{URLs: []string{turnURL}, Username: user, Credential: pass}}
+}
+
+func newHub() *hub {
+	h := &hub{
+		peers:         make(map[string]*peer),
+		clientIDs:     make(map[string]*peer),
+		nodes:         make(map[string]*nodeLink),
+		topo:          make(map[string][]string),
+		linkRtt:       make(map[string]map[string]int64),
+		joinTokens:    make(map[string]time.Time),
+		forwardTokens: make(map[string]string),
+		fileRoute:     make(map[string]string),
+		fileBuf:       make(map[string][]byte),
+		fileWait:      make(map[string][]chan *chatFile),
+		linkPending:   make(map[string]bool),
+		ctrlReqs:      make(map[string]*ctrlReq),
+		ctrlActive:    make(map[string]*ctrlReq),
+		logSubs:       make(map[string]bool),
+	}
+	h.sfu = &SFU{hub: h, streams: make(map[string]*stream), viewers: make(map[string]*viewerConn)}
+	h.chatFiles = make(map[string]*chatFile)
+	h.nodeId = randomToken(4)
+	h.serverStart = time.Now().UnixMilli()
+	log.Printf("node: 本节点 id = %s", h.nodeId)
+	return h
+}
+
+func newPeerConnection(iceServers []webrtc.ICEServer) (*webrtc.PeerConnection, error) {
+	return webrtc.NewPeerConnection(webrtc.Configuration{ICEServers: iceServers})
+}
+
+func (p *peer) sharing() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pubPC != nil
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+var hostAddrsOnce sync.Once
+var hostAddrs []string
+
+// isHostConn 判断连接来源是否本机（服务器主机：loopback 或本服务监听地址）
+func isHostConn(r *http.Request) bool {
+	host := r.RemoteAddr
+	if host == "" {
+		return false
+	}
+	hstr, _, err := net.SplitHostPort(host)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(hstr)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() {
+		return true
+	}
+	hostAddrsOnce.Do(func() { hostAddrs = detectIPv6() })
+	for _, a := range hostAddrs {
+		if p := net.ParseIP(a); p != nil && p.Equal(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP 提取连接来源 IP（去端口）
+func clientIP(r *http.Request) string {
+	host := r.RemoteAddr
+	if host == "" {
+		return ""
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
+	conn, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		return
+	}
+	p := &peer{hub: h, conn: conn, send: make(chan []byte, 32), host: isHostConn(r), ip: clientIP(r)}
+	go p.writeLoop()
+	p.readLoop()
+}
+
+func (p *peer) readLoop() {
+	defer func() {
+		p.hub.unregister(p)
+		p.conn.Close()
+	}()
+	for {
+		_, data, err := p.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var m map[string]any
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		p.handle(m)
+	}
+}
+
+func (p *peer) writeLoop() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case msg, ok := <-p.send:
+			if !ok {
+				return
+			}
+			if err := p.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := p.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
+}
+
+func (p *peer) handle(m map[string]any) {
+	switch m["type"] {
+	case "hello":
+		p.handleHello(m)
+	case "publish-offer":
+		p.handlePublishOffer(m)
+	case "subscribe-answer":
+		p.handleSubscribeAnswer(m)
+	case "candidate":
+		p.handleCandidate(m)
+	case "share-stop":
+		p.hub.sfu.removeStreamVideo(p.id, nil) // 停止屏幕共享：仅移除视频，保留独立音频通道
+	case "share-config":
+		p.handleShareConfig(m)
+	case "viewer-config":
+		p.handleViewerConfig(m)
+	case "chat":
+		p.handleChat(m)
+	case "ping":
+		sendMsg(p, map[string]any{"type": "pong", "t": m["t"]})
+	case "resubscribe": // 前端订阅 ICE 失败：重建订阅连接（P2P 会话不受影响）
+		p.hub.sfu.resetSubscriber(p.id)
+	case "ctrl":
+		p.handleCtrl(m)
+	case "log-subscribe": // 打开日志窗口：开始接收服务器日志
+		p.hub.logSubscribe(p)
+	case "log-unsubscribe": // 关闭日志窗口
+		p.hub.logUnsubscribe(p)
+	case "pong":
+		if t, ok := m["t"].(float64); ok {
+			now := time.Now().UnixMilli()
+			p.mu.Lock()
+			p.rttMs = now - int64(t)
+			p.lastPong = now
+			p.mu.Unlock()
+		}
+	}
+}
+
+// ---- 远程控制（P2-2）：仅支持控制"本机 host（服务器运行者）的屏幕"，被控端确认后单一控制者 ----
+
+func (p *peer) handleCtrl(m map[string]any) {
+	action, _ := m["action"].(string)
+	switch action {
+	case "request":
+		target, _ := m["target"].(string)
+		p.hub.ctrlRequest(p, target)
+	case "respond":
+		target, _ := m["target"].(string)
+		accept, _ := m["accept"].(bool)
+		p.hub.ctrlRespond(p, target, accept)
+	case "invite": // 被控端（host）邀请指定观看者控制
+		target, _ := m["target"].(string)
+		p.hub.ctrlInvite(p, target)
+	case "invite-respond": // 被邀请者回应
+		accept, _ := m["accept"].(bool)
+		p.hub.ctrlInviteRespond(p, accept)
+	case "release":
+		p.hub.ctrlRelease(p)
+	case "revoke":
+		p.hub.ctrlRevoke(p)
+	case "mouse":
+		if !p.hub.ctrlIsController(p) {
+			return
+		}
+		x, _ := m["x"].(float64)
+		y, _ := m["y"].(float64)
+		ax, ay := p.hub.ctrlAbsCoords(p, int(x), int(y))
+		ctrlMouseMove(ax, ay)
+	case "click":
+		if !p.hub.ctrlIsController(p) {
+			return
+		}
+		button, _ := m["button"].(string)
+		down, _ := m["down"].(bool)
+		ctrlMouseButton(button, down)
+	case "scroll":
+		if !p.hub.ctrlIsController(p) {
+			return
+		}
+		dy, _ := m["dy"].(float64)
+		ctrlMouseWheel(int(dy))
+	case "key":
+		if !p.hub.ctrlIsController(p) {
+			return
+		}
+		code, _ := m["code"].(string)
+		down, _ := m["down"].(bool)
+		ctrlKey(code, down)
+	}
+}
+
+func (h *hub) ctrlRequest(p *peer, target string) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	tgt := h.peers[target]
+	if tgt == nil {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "对方不在线"})
+		return
+	}
+	if target == p.id {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "不能控制自己"})
+		return
+	}
+	if !tgt.host {
+		// 只有服务器运行者（本机浏览器）的屏幕可被控（SendInput 执行在本机）
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "仅支持控制服务器运行者的屏幕"})
+		return
+	}
+	if act, ok := h.ctrlActive[target]; ok && act.controllerID != p.id {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "该用户已被他人控制"})
+		return
+	}
+	if req, ok := h.ctrlReqs[target]; ok {
+		if req.controllerID == p.id {
+			sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": true, "pending": true})
+		} else {
+			sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "该用户有正在等待同意的控制请求"})
+		}
+		return
+	}
+	name := p.name
+	h.ctrlReqs[target] = &ctrlReq{controllerID: p.id, controllerName: name, at: time.Now()}
+	sendMsg(tgt, map[string]any{"type": "ctrl", "action": "request", "controller": p.id, "controllerName": name})
+}
+
+func (h *hub) ctrlRespond(p *peer, target string, accept bool) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	if p.id != target {
+		return // 仅被控端本人可回应
+	}
+	req := h.ctrlReqs[target]
+	if req == nil {
+		return
+	}
+	delete(h.ctrlReqs, target)
+	ctl := h.peers[req.controllerID]
+	if ctl == nil {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "request-result", "ok": false, "reason": "控制者已离线"})
+		return
+	}
+	if !accept {
+		sendMsg(ctl, map[string]any{"type": "ctrl", "action": "denied"})
+		return
+	}
+	h.ctrlActive[target] = req
+	sendMsg(ctl, map[string]any{"type": "ctrl", "action": "granted", "target": target})
+	sendMsg(p, map[string]any{"type": "ctrl", "action": "controlled", "controller": req.controllerID, "controllerName": req.controllerName})
+}
+
+// ctrlInvite 被控端（host）邀请指定观看者控制自己的屏幕
+func (h *hub) ctrlInvite(p *peer, target string) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	if !p.host {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "仅服务器运行者（本机）可发起控制邀请"})
+		return
+	}
+	if target == "" || target == p.id {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "邀请对象无效"})
+		return
+	}
+	invitee := h.peers[target]
+	if invitee == nil {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "对方不在线"})
+		return
+	}
+	if _, ok := h.ctrlActive[p.id]; ok {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "你正被他人控制，无法发起邀请"})
+		return
+	}
+	if req, ok := h.ctrlReqs[p.id]; ok {
+		if req.controllerID == target {
+			sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "已向该用户发出邀请，等待回应"})
+		} else {
+			sendMsg(p, map[string]any{"type": "ctrl", "action": "invite-failed", "reason": "有正在等待回应的控制请求"})
+		}
+		return
+	}
+	h.ctrlReqs[p.id] = &ctrlReq{controllerID: target, controllerName: invitee.name, at: time.Now()}
+	sendMsg(invitee, map[string]any{"type": "ctrl", "action": "invite-received", "controller": p.id, "controllerName": p.name})
+}
+
+// ctrlInviteRespond 被邀请者回应控制邀请
+func (h *hub) ctrlInviteRespond(p *peer, accept bool) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	var target string
+	var req *ctrlReq
+	for t, r := range h.ctrlReqs {
+		if r.controllerID == p.id {
+			target, req = t, r
+			break
+		}
+	}
+	if req == nil {
+		return
+	}
+	delete(h.ctrlReqs, target)
+	host := h.peers[target]
+	if host == nil {
+		sendMsg(p, map[string]any{"type": "ctrl", "action": "denied", "reason": "对方已离线"})
+		return
+	}
+	if !accept {
+		sendMsg(host, map[string]any{"type": "ctrl", "action": "invite-declined"})
+		return
+	}
+	h.ctrlActive[target] = req
+	sendMsg(p, map[string]any{"type": "ctrl", "action": "granted", "target": target})
+	sendMsg(host, map[string]any{"type": "ctrl", "action": "controlled", "controller": req.controllerID, "controllerName": req.controllerName})
+}
+
+// ctrlRelease 控制者主动释放
+func (h *hub) ctrlRelease(p *peer) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	for target, req := range h.ctrlActive {
+		if req.controllerID == p.id {
+			delete(h.ctrlActive, target)
+			if tgt := h.peers[target]; tgt != nil {
+				sendMsg(tgt, map[string]any{"type": "ctrl", "action": "released"})
+			}
+			return
+		}
+	}
+}
+
+// ctrlRevoke 被控端收回控制权
+func (h *hub) ctrlRevoke(p *peer) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	req := h.ctrlActive[p.id]
+	if req == nil {
+		return
+	}
+	delete(h.ctrlActive, p.id)
+	if ctl := h.peers[req.controllerID]; ctl != nil {
+		sendMsg(ctl, map[string]any{"type": "ctrl", "action": "revoked"})
+	}
+}
+
+// ctrlIsController 判断 p 是否为某活跃会话的控制者（非本节点 host 无法被控）
+func (h *hub) ctrlIsController(p *peer) bool {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	for target, req := range h.ctrlActive {
+		if req.controllerID == p.id {
+			if h.peers[target] == nil {
+				delete(h.ctrlActive, target)
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// ctrlTargetOf 返回 p 作为控制者的被控端 id（非控制者返回空）
+func (h *hub) ctrlTargetOf(p *peer) string {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	for target, req := range h.ctrlActive {
+		if req.controllerID == p.id {
+			return target
+		}
+	}
+	return ""
+}
+
+// ctrlAbsCoords 把主控端相对坐标(0-65535，相对被控端共享的屏幕)换算为虚拟桌面物理像素坐标。
+// 依据：被控端共享流分辨率（share-config 上报）匹配显示器布局，得到该屏在虚拟桌面中的位置。
+// 单屏/无目标/匹配失败均回退主屏换算（主屏 left/top 通常为 0，行为与原主屏绝对坐标一致）。
+func (h *hub) ctrlAbsCoords(p *peer, relX, relY int) (int, int) {
+	layout := currentMonitorLayout()
+	if len(layout.Monitors) == 0 {
+		return relX, relY // 极异常：无任何显示器
+	}
+	primary := layout.primaryMonitor()
+	target := h.ctrlTargetOf(p)
+	if target == "" || len(layout.Monitors) <= 1 {
+		return layout.toVirtualPx(primary, relX, relY) // 单屏：按主屏换算
+	}
+	w, ht := 0, 0
+	h.mu.Lock()
+	if cfg, ok := h.streamCfgs[target]; ok {
+		if fw, ok := cfg["width"].(float64); ok {
+			w = int(fw)
+		}
+		if fh, ok := cfg["height"].(float64); ok {
+			ht = int(fh)
+		}
+	}
+	h.mu.Unlock()
+	if w > 0 && ht > 0 {
+		if m, ok := layout.matchMonitor(w, ht); ok {
+			return layout.toVirtualPx(m, relX, relY) // 命中副屏：按该屏换算
+		}
+	}
+	return layout.toVirtualPx(primary, relX, relY) // 匹配失败：回退主屏
+}
+
+// ctrlCleanup 用户断开时清理其相关控制会话（作为被控端/控制者/待确认请求）
+func (h *hub) ctrlCleanup(id string) {
+	h.ctrlMu.Lock()
+	defer h.ctrlMu.Unlock()
+	if req, ok := h.ctrlActive[id]; ok { // 作为被控端断开
+		delete(h.ctrlActive, id)
+		if ctl := h.peers[req.controllerID]; ctl != nil {
+			sendMsg(ctl, map[string]any{"type": "ctrl", "action": "revoked", "reason": "对方已断开"})
+		}
+	}
+	for target, req := range h.ctrlActive { // 作为控制者断开
+		if req.controllerID == id {
+			delete(h.ctrlActive, target)
+			if tgt := h.peers[target]; tgt != nil {
+				sendMsg(tgt, map[string]any{"type": "ctrl", "action": "released", "reason": "控制者已断开"})
+			}
+		}
+	}
+	for target, req := range h.ctrlReqs { // 待确认请求清理
+		if req.controllerID == id || target == id {
+			delete(h.ctrlReqs, target)
+			if tgt := h.peers[target]; tgt != nil && tgt.id != id {
+				sendMsg(tgt, map[string]any{"type": "ctrl", "action": "request-cancel"})
+			}
+		}
+	}
+}
+
+func (h *hub) broadcast(m map[string]any) {
+	h.mu.Lock()
+	peers := make([]*peer, 0, len(h.peers))
+	for _, p := range h.peers {
+		peers = append(peers, p)
+	}
+	h.mu.Unlock()
+	for _, p := range peers {
+		sendMsg(p, m)
+	}
+}
+
+// broadcastExcept 向除 except 外的所有 peer 广播
+func (h *hub) broadcastExcept(except *peer, m map[string]any) {
+	h.mu.Lock()
+	peers := make([]*peer, 0, len(h.peers))
+	for _, p := range h.peers {
+		if p != except {
+			peers = append(peers, p)
+		}
+	}
+	h.mu.Unlock()
+	for _, p := range peers {
+		sendMsg(p, m)
+	}
+}
+
+func (h *hub) peerInfo(p *peer) map[string]any {
+	return map[string]any{"id": p.id, "name": p.name, "color": p.color, "sharing": p.sharing(), "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId}
+}
+
+func (p *peer) handleHello(m map[string]any) {
+	h := p.hub
+	h.mu.Lock()
+	name, _ := m["name"].(string)
+	clientID, _ := m["clientId"].(string)
+	enterHost, _ := m["enterHost"].(string)
+	if name == "" {
+		name = fmt.Sprintf("访客-%d", h.seq+1)
+	}
+	if clientID != "" && h.clientIDs[clientID] != nil && h.clientIDs[clientID] != p {
+		// 同一浏览器刷新/重连：顶替旧连接，沿用身份（id/颜色）
+		old := h.clientIDs[clientID]
+		old.replaced = true
+		p.clientID = clientID
+		p.id = old.id
+		p.color = old.color
+		h.peers[p.id] = p
+		h.clientIDs[clientID] = p
+		h.mu.Unlock()
+		// 清理旧连接资源（推流/订阅/流），避免与新连接冲突
+		h.sfu.removeAllStreams(old.id)
+		h.sfu.removeViewer(old.id)
+		old.mu.Lock()
+		pub := old.pubPC
+		old.pubPC = nil
+		cam := old.camPC
+		old.camPC = nil
+		audioPubs := old.audioPubPCs
+		old.audioPubPCs = nil
+		old.mu.Unlock()
+		if pub != nil {
+			pub.Close()
+		}
+		if cam != nil {
+			cam.Close()
+		}
+		for _, ap := range audioPubs {
+			ap.Close()
+		}
+		old.conn.Close() // 触发旧连接 readLoop 退出 → unregister（replaced 跳过广播）
+		h.mu.Lock()
+	} else if _, exists := h.peers[p.id]; !exists {
+		h.seq++
+		p.id = fmt.Sprintf("u%d", h.seq)
+		p.color = palette[(h.seq-1)%len(palette)]
+		h.peers[p.id] = p
+		if clientID != "" {
+			p.clientID = clientID
+			h.clientIDs[clientID] = p
+		}
+	}
+	p.name = name           // 重复 hello（设置昵称）也更新名字
+	p.enterHost = enterHost // 重复 hello 也更新进入地址（页面刷新/换地址进入）
+	// 所属节点服务运行者标记：host 浏览器指向自己；普通用户指向本节点 host（host 未上线为空，上线时补填）
+	hostUpdated := false
+	if p.host {
+		if p.hostId == "" {
+			p.hostId = p.id
+			hostUpdated = true
+		}
+		for _, q := range h.peers {
+			if q.host {
+				continue
+			}
+			if q.hostId == "" {
+				q.hostId = p.id
+				hostUpdated = true
+			} else if h.peers[q.hostId] == nil {
+				// host 重连换了新 id（刷新后顶替失败）：把指向已离线 host 的用户重指到当前 host
+				q.hostId = p.id
+				hostUpdated = true
+			}
+		}
+	} else if p.hostId == "" {
+		for _, q := range h.peers {
+			if q.host {
+				p.hostId = q.id
+				break
+			}
+		}
+	}
+	log.Printf("hello: %s(%s) 在线用户=%d 流=%d", p.id, p.name, len(h.peers), len(h.sfu.streams))
+	peers := make([]map[string]any, 0, len(h.peers))
+	for _, q := range h.peers {
+		if q == p {
+			continue
+		}
+		peers = append(peers, h.peerInfo(q))
+	}
+	h.mu.Unlock()
+
+	streamCfgs := make(map[string]map[string]any, len(h.streamCfgs))
+	h.mu.Lock()
+	for k, v := range h.streamCfgs {
+		streamCfgs[k] = v
+	}
+	h.mu.Unlock()
+
+	streams := make([]map[string]any, 0, len(h.sfu.streams))
+	h.sfu.mu.Lock()
+	for _, st := range h.sfu.streams {
+		s := map[string]any{"id": st.ID, "ownerId": st.OwnerID, "codec": st.Codec.MimeType}
+		if len(st.Layers) == 0 {
+			s["audioOnly"] = true
+		}
+		if cfg, ok := streamCfgs[st.ID]; ok {
+			s["config"] = cfg
+		}
+		streams = append(streams, s)
+	}
+	h.sfu.mu.Unlock()
+
+	sendMsg(p, map[string]any{"type": "welcome", "id": p.id, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "peers": peers, "streams": streams})
+	h.broadcastExcept(p, map[string]any{"type": "peer-joined", "id": p.id, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId})
+	if hostUpdated {
+		// host 上线（含晚于他人加入）：广播补填，前端将 hostId 为空的用户指向该服务运行者
+		h.broadcastExcept(p, map[string]any{"type": "host-updated", "id": p.id, "name": p.name})
+	}
+	h.sfu.ensureSubscriber(p.id)
+	// 补发聊天历史（新成员可见最近消息）
+	h.mu.Lock()
+	hist := make([]map[string]any, len(h.chatHist))
+	copy(hist, h.chatHist)
+	h.mu.Unlock()
+	if len(hist) > 0 {
+		sendMsg(p, map[string]any{"type": "chat-history", "messages": hist})
+	}
+	h.broadcastTopo()          // 本节点子用户变化（拓扑图刷新）
+	h.forwardPeerAddToNodes(p) // 跨节点同步：本节点用户加入/改名，通知所有邻居
+}
+
+// forwardPeerAddToNodes 向所有邻居广播本节点用户的加入/更新（node-peer-add）
+func (h *hub) forwardPeerAddToNodes(p *peer) {
+	h.mu.Lock()
+	links := make([]*nodeLink, 0, len(h.nodes))
+	for _, nl := range h.nodes {
+		links = append(links, nl)
+	}
+	h.mu.Unlock()
+	for _, nl := range links {
+		nl.sendMsg(map[string]any{"type": "node-peer-add", "peer": h.peerInfo(p)})
+	}
+}
+
+// forwardPeerRemoveToNodes 向所有邻居广播本节点用户的离开（node-peer-remove）
+func (h *hub) forwardPeerRemoveToNodes(id string) {
+	h.mu.Lock()
+	links := make([]*nodeLink, 0, len(h.nodes))
+	for _, nl := range h.nodes {
+		links = append(links, nl)
+	}
+	h.mu.Unlock()
+	for _, nl := range links {
+		nl.sendMsg(map[string]any{"type": "node-peer-remove", "id": id})
+	}
+}
+
+func (p *peer) handlePublishOffer(m map[string]any) {
+	h := p.hub
+	pcType, _ := m["pc"].(string)
+	if pcType == "" {
+		pcType = "publish"
+	}
+	sd, _ := m["sdp"].(map[string]any)
+	sdpStr, _ := sd["sdp"].(string)
+	sdpType, _ := sd["type"].(string)
+	if sdpStr == "" || sdpType != "offer" {
+		return
+	}
+
+	audioKind := ""
+	if pcType == "audio-mic" {
+		audioKind = "mic"
+	} else if pcType == "audio-system" {
+		audioKind = "system"
+	}
+	// 摄像头流独立 ID（观看端卡片显示为第二视频区）
+	streamID := ""
+	if pcType == "camera" {
+		streamID = p.id + "-cam"
+	}
+
+	// 关闭同类型旧连接
+	p.mu.Lock()
+	if audioKind != "" {
+		if p.audioPubPCs[audioKind] != nil {
+			p.audioPubPCs[audioKind].Close()
+			delete(p.audioPubPCs, audioKind)
+		}
+	} else if pcType == "camera" {
+		if p.camPC != nil {
+			p.camPC.Close()
+			p.camPC = nil
+		}
+	} else if pcType == "publish" {
+		if p.pubPC != nil {
+			p.pubPC.Close()
+			p.pubPC = nil
+		}
+	}
+	p.mu.Unlock()
+
+	pc, err := newPeerConnection(h.sfu.iceServers)
+	if err != nil {
+		return
+	}
+	if pcType == "publish" {
+		// 声明 simulcast 三档接收（l/m/h），保证各层分别触发 OnTrack
+		pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{ //nolint:errcheck
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			SendEncodings: []webrtc.RTPEncodingParameters{
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "l"}},
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "m"}},
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "h"}},
+			},
+		})
+	} else if pcType == "camera" {
+		// 摄像头流同样声明 simulcast 三档接收（l/m/h），观看端可切换档位
+		pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{ //nolint:errcheck
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
+			SendEncodings: []webrtc.RTPEncodingParameters{
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "l"}},
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "m"}},
+				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "h"}},
+			},
+		})
+	}
+	p.mu.Lock()
+	if audioKind != "" {
+		if p.audioPubPCs == nil {
+			p.audioPubPCs = make(map[string]*webrtc.PeerConnection)
+		}
+		p.audioPubPCs[audioKind] = pc
+	} else if pcType == "camera" {
+		p.camPC = pc
+	} else {
+		p.pubPC = pc
+	}
+	p.mu.Unlock()
+
+	pc.OnTrack(func(remote *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		if remote.Kind() == webrtc.RTPCodecTypeAudio {
+			h.onStreamAudio(p.id, remote, pc, audioKind)
+			return
+		}
+		if (pcType == "publish" || pcType == "camera") && remote.Kind() == webrtc.RTPCodecTypeVideo {
+			rid := remote.RID()
+			if rid == "" {
+				rid = "m"
+			}
+			logV("publish: %s 到达层 rid=%s codec=%s pc=%s", p.id, rid, remote.Codec().MimeType, pcType)
+			h.onStreamLayer(p.id, remote, rid, pc, streamID)
+		}
+	})
+	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
+		if pcType == "camera" {
+			log.Printf("camera: %s ICE 状态=%s", p.id, s) // 诊断：摄像头推流连接状态
+		}
+		if s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed || s == webrtc.ICEConnectionStateDisconnected {
+			if audioKind != "" {
+				h.sfu.removeStreamAudio(p.id, audioKind) // 音频通道断开：仅移除该通道（视频流可能仍在）
+			} else if pcType == "camera" {
+				h.sfu.removeStreamVideo(p.id+"-cam", pc)
+			} else {
+				h.sfu.removeStreamVideo(p.id, pc) // 屏幕连接断开：仅移除该连接产生的流
+			}
+		}
+	})
+	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+		if c == nil {
+			return
+		}
+		sendMsg(p, map[string]any{"type": "candidate", "pc": pcType, "candidate": c.ToJSON()})
+	})
+
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr}); err != nil {
+		log.Printf("publish: SetRemoteDescription 失败 %s: %v", p.id, err)
+		pc.Close()
+		return
+	}
+	answer, err := pc.CreateAnswer(nil)
+	if err != nil {
+		log.Printf("publish: CreateAnswer 失败 %s: %v", p.id, err)
+		pc.Close()
+		return
+	}
+	if err := pc.SetLocalDescription(answer); err != nil {
+		log.Printf("publish: SetLocalDescription 失败 %s: %v", p.id, err)
+		pc.Close()
+		return
+	}
+	log.Printf("publish: %s 推流协商完成 (%s)", p.id, pcType)
+	sendMsg(p, map[string]any{"type": "publish-answer", "pc": pcType, "sdp": answer})
+}
+
+// rewriteTrack 是自定义 TrackLocal：把转发 RTP 包的 SSRC 改写为
+// 每个观看者 sender 协商的固定 SSRC。切档位（ReplaceTrack 换层）时
+// 观看者看到的 SSRC 保持不变，避免 Chrome 因 SSRC 与 SDP 不符而花屏。
+type rewriteTrack struct {
+	codec      webrtc.RTPCodecCapability
+	id         string
+	streamID   string
+	rid        string
+	sourcePC   *webrtc.PeerConnection // 源推流连接（发 PLI 用）
+	sourceSSRC uint32                 // 源该层 SSRC（发 PLI 用）
+
+	mu      sync.Mutex
+	writers map[webrtc.SSRC]webrtc.TrackLocalWriter
+}
+
+func newRewriteTrack(c webrtc.RTPCodecCapability, id, streamID, rid string, sourcePC *webrtc.PeerConnection, sourceSSRC uint32) *rewriteTrack {
+	return &rewriteTrack{codec: c, id: id, streamID: streamID, rid: rid, sourcePC: sourcePC, sourceSSRC: sourceSSRC, writers: make(map[webrtc.SSRC]webrtc.TrackLocalWriter)}
+}
+
+func (t *rewriteTrack) Bind(ctx webrtc.TrackLocalContext) (webrtc.RTPCodecParameters, error) {
+	t.mu.Lock()
+	t.writers[ctx.SSRC()] = ctx.WriteStream()
+	t.mu.Unlock()
+	// 绑定（含 ReplaceTrack 换层）成功即请求源出关键帧，避免观看者等待自动关键帧而卡住
+	t.requestKeyFrame()
+	for _, cp := range ctx.CodecParameters() {
+		if cp.MimeType == t.codec.MimeType {
+			return cp, nil
+		}
+	}
+	// 降级：取任意 video codec，避免协商失败导致 AddTrack/ReplaceTrack 失败
+	for _, cp := range ctx.CodecParameters() {
+		if strings.HasPrefix(cp.MimeType, "video/") {
+			return cp, nil
+		}
+	}
+	return webrtc.RTPCodecParameters{}, fmt.Errorf("no video codec for %s", t.codec.MimeType)
+}
+
+func (t *rewriteTrack) requestKeyFrame() {
+	if t.sourcePC == nil || t.sourceSSRC == 0 {
+		return
+	}
+	go func() {
+		if t.sourcePC.ConnectionState() == webrtc.PeerConnectionStateConnected {
+			t.sourcePC.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: t.sourceSSRC}}) //nolint:errcheck
+			time.Sleep(400 * time.Millisecond)
+			if t.sourcePC.ConnectionState() == webrtc.PeerConnectionStateConnected {
+				t.sourcePC.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: t.sourceSSRC}}) //nolint:errcheck
+			}
+		}
+	}()
+}
+
+func (t *rewriteTrack) Unbind(ctx webrtc.TrackLocalContext) error {
+	t.mu.Lock()
+	delete(t.writers, ctx.SSRC())
+	t.mu.Unlock()
+	return nil
+}
+
+func (t *rewriteTrack) ID() string       { return t.id }
+func (t *rewriteTrack) StreamID() string { return t.streamID }
+func (t *rewriteTrack) RID() string      { return t.rid }
+func (t *rewriteTrack) Kind() webrtc.RTPCodecType {
+	if strings.HasPrefix(t.codec.MimeType, "audio/") {
+		return webrtc.RTPCodecTypeAudio
+	}
+	return webrtc.RTPCodecTypeVideo
+}
+
+// WriteRTP 按每个观看者协商的 SSRC 分别改写后写入
+// 注意：先快照 writer 再释放锁，避免写入阻塞（TCP 背压）时挂起 Bind/Unbind
+func (t *rewriteTrack) WriteRTP(p *rtp.Packet) error {
+	t.mu.Lock()
+	writers := make(map[webrtc.SSRC]webrtc.TrackLocalWriter, len(t.writers))
+	for ssrc, w := range t.writers {
+		writers[ssrc] = w
+	}
+	t.mu.Unlock()
+	for ssrc, w := range writers {
+		p.Header.SSRC = uint32(ssrc)
+		if _, err := w.WriteRTP(&p.Header, p.Payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// onStreamAudio 处理共享者的音频 track（音频恒独立流：key = ownerID+"-a"，多通道可共存）
+func (h *hub) onStreamAudio(ownerID string, remote *webrtc.TrackRemote, sourcePC *webrtc.PeerConnection, kind string) {
+	if kind == "" {
+		kind = "audio"
+	}
+	streamID := ownerID + "-a"
+	s := h.sfu
+	s.mu.Lock()
+	st := s.streams[streamID]
+	isNew := false
+	if st == nil {
+		st = &stream{
+			ID:       streamID,
+			OwnerID:  ownerID,
+			SourcePC: sourcePC,
+			Codec:    remote.Codec().RTPCodecCapability,
+			Layers:   make(map[string]*rewriteTrack),
+			Remote:   make(map[string]*webrtc.TrackRemote),
+		}
+		s.streams[streamID] = st
+		isNew = true
+	}
+	if st.AudioTracks == nil {
+		st.AudioTracks = make(map[string]*rewriteTrack)
+		st.AudioRemotes = make(map[string]*webrtc.TrackRemote)
+	}
+	// 每通道独立 MediaStream（msid = streamID+"-"+kind，如 u3-a-mic）——接收端可分别控制
+	audioLocal := newRewriteTrack(remote.Codec().RTPCodecCapability, "audio-"+kind, streamID+"-"+kind, "", sourcePC, uint32(remote.SSRC()))
+	st.AudioTracks[kind] = audioLocal
+	st.AudioRemotes[kind] = remote
+	s.mu.Unlock()
+
+	go func() {
+		for {
+			pkt, _, err := remote.ReadRTP()
+			if err != nil {
+				return
+			}
+			if err := audioLocal.WriteRTP(pkt); err != nil {
+				return
+			}
+		}
+	}()
+	if isNew {
+		h.mu.Lock()
+		oname := ""
+		if owner := h.peers[ownerID]; owner != nil {
+			oname = owner.name
+		}
+		h.mu.Unlock()
+		log.Printf("stream-added: %s(%s) 音频流广播", streamID, oname)
+		h.broadcast(map[string]any{"type": "stream-added", "id": streamID, "ownerId": ownerID, "ownerName": oname, "codec": remote.Codec().MimeType, "audioOnly": true})
+	}
+	// 通知已订阅观看者补加音频
+	s.ensureAllSubscribers()
+	h.nodeStreamAdded(st)
+	logV("publish: %s 音频到达 kind=%s codec=%s", ownerID, kind, remote.Codec().MimeType)
+}
+
+// onStreamLayer 处理共享者的一个 simulcast 层到达，返回是否新流。
+// streamID 为空时默认使用 ownerID（屏幕共享）；摄像头流传入 ownerID+"-cam"
+func (h *hub) onStreamLayer(ownerID string, remote *webrtc.TrackRemote, rid string, sourcePC *webrtc.PeerConnection, streamID string) bool {
+	if streamID == "" {
+		streamID = ownerID
+	}
+	s := h.sfu
+	s.mu.Lock()
+	st := s.streams[streamID]
+	if st == nil {
+		st = &stream{
+			ID:       streamID,
+			OwnerID:  ownerID,
+			SourcePC: sourcePC,
+			Codec:    remote.Codec().RTPCodecCapability,
+			Layers:   make(map[string]*rewriteTrack),
+			Remote:   make(map[string]*webrtc.TrackRemote),
+		}
+		s.streams[streamID] = st
+	}
+	local := newRewriteTrack(remote.Codec().RTPCodecCapability, "video-"+rid, streamID, rid, sourcePC, uint32(remote.SSRC()))
+	st.Layers[rid] = local
+	st.Remote[rid] = remote
+	isNew := len(st.Layers) == 1
+	s.mu.Unlock()
+
+	go func() {
+		for {
+			pkt, _, err := remote.ReadRTP()
+			if err != nil {
+				return
+			}
+			if err := local.WriteRTP(pkt); err != nil {
+				return
+			}
+		}
+	}()
+
+	if isNew {
+		h.mu.Lock()
+		oname := ""
+		if owner := h.peers[ownerID]; owner != nil {
+			oname = owner.name
+		}
+		h.mu.Unlock()
+		log.Printf("stream-added: %s(%s) 新流广播", streamID, oname)
+		h.broadcast(map[string]any{"type": "stream-added", "id": streamID, "ownerId": ownerID, "ownerName": oname, "codec": remote.Codec().MimeType})
+		go s.streamKeeper(st) // 流保活：REMB（防 Safari 无接收端反馈暂停视频帧）+ 周期性 PLI（关键帧保底）
+	}
+	// 每次层到达都补订：覆盖"流条目存在但层未就绪时观看者被跳过"的竞态（首次页面/刷新时黑屏隐患）
+	s.ensureAllSubscribers()
+	h.nodeStreamAdded(st)
+	return isNew
+}
+
+// broadcastWatchers 广播某共享者当前的观看者数量（s.mu 需已释放）
+func (s *SFU) broadcastWatchers(ownerID string) {
+	s.mu.Lock()
+	count := 0
+	audioPrefix := ownerID + "-a-"
+	for _, vc := range s.viewers {
+		subscribed := false
+		if _, ok := vc.senders[ownerID]; ok {
+			subscribed = true
+		}
+		if !subscribed {
+			for key := range vc.audioSender {
+				if len(key) > len(audioPrefix) && key[:len(audioPrefix)] == audioPrefix {
+					subscribed = true
+					break
+				}
+			}
+		}
+		if subscribed {
+			count++
+		}
+	}
+	s.mu.Unlock()
+	s.hub.broadcast(map[string]any{"type": "watchers", "ownerId": ownerID, "count": count})
+}
+
+// ensureSubscriber 确保观看者有拉流连接并包含全部（除自己）流
+func (s *SFU) ensureSubscriber(viewerID string) {
+	s.mu.Lock()
+	vc := s.viewers[viewerID]
+	if vc == nil {
+		h := s.hub
+		var peer *peer
+		h.mu.Lock()
+		peer = h.peers[viewerID]
+		h.mu.Unlock()
+		if peer == nil {
+			s.mu.Unlock()
+			log.Printf("subscribe: %s 不在线，跳过", viewerID)
+			return
+		}
+		pc, err := newPeerConnection(s.iceServers)
+		if err != nil {
+			s.mu.Unlock()
+			log.Printf("subscribe: %s 创建 pc 失败: %v", viewerID, err)
+			return
+		}
+		vc = &viewerConn{peer: peer, pc: pc, senders: make(map[string]*webrtc.RTPSender), audioSender: make(map[string]*webrtc.RTPSender), tiers: make(map[string]string), negCh: make(chan struct{}, 1)}
+		pc.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+			sendMsg(peer, map[string]any{"type": "candidate", "pc": "subscribe", "candidate": c.ToJSON()})
+		})
+		pc.OnICEConnectionStateChange(func(st webrtc.ICEConnectionState) {
+			logV("subscribe: %s ICE 状态=%s", viewerID, st)
+			if st == webrtc.ICEConnectionStateClosed {
+				pc.Close()
+			}
+		})
+		s.viewers[viewerID] = vc
+		logV("subscribe: %s 订阅连接已创建", viewerID)
+	}
+	changed := false
+	for id, st := range s.streams {
+		if id == viewerID || strings.HasPrefix(id, viewerID+"-") {
+			continue // 不订阅自己（含自己的子流：主视频/摄像头/音频）
+		}
+		if _, ok := vc.senders[id]; ok {
+			continue
+		}
+		local := st.Layers["l"] // 默认档位：流畅（省带宽、更稳定）
+		if local == nil {
+			for _, l := range st.Layers {
+				local = l
+				break
+			}
+		}
+		if local == nil {
+			if len(st.AudioTracks) > 0 {
+				continue // 纯音频流：无视频层，由下方音频循环订阅（不打日志避免刷屏）
+			}
+			log.Printf("subscribe: %s 流 %s 层未就绪", viewerID, id)
+			continue // 层尚未到达
+		}
+		sender, err := vc.pc.AddTrack(local)
+		if err != nil {
+			log.Printf("subscribe: AddTrack 失败 viewer=%s stream=%s: %v", viewerID, id, err)
+			continue
+		}
+		vc.senders[id] = sender
+		vc.tiers[id] = "l"
+		go s.forwardPLI(vc, id, sender, st)
+		changed = true
+		logV("subscribe: %s 已订阅流 %s", viewerID, id)
+		// 音频：随视频一起订阅全部通道（无 PLI）
+		for kind, al := range st.AudioTracks {
+			if _, ok := vc.audioSender[id+"-"+kind]; ok {
+				continue
+			}
+			aSender, err := vc.pc.AddTrack(al)
+			if err != nil {
+				log.Printf("subscribe: 音频 AddTrack 失败 viewer=%s stream=%s kind=%s: %v", viewerID, id, kind, err)
+				continue
+			}
+			vc.audioSender[id+"-"+kind] = aSender
+			logV("subscribe: %s 已订阅流 %s 音频(%s)", viewerID, id, kind)
+		}
+	}
+	// 音频：视频流后到/纯音频流（无视频层）时订阅全部音频通道（mic/system 可共存）
+	for id, st := range s.streams {
+		if id == viewerID || strings.HasPrefix(id, viewerID+"-") {
+			continue // 不订阅自己（含自己的子流）
+		}
+		if len(st.AudioTracks) == 0 {
+			continue
+		}
+		if len(st.Layers) > 0 {
+			if _, ok := vc.senders[id]; !ok {
+				continue // 有视频的流：先订阅视频
+			}
+		}
+		for kind, al := range st.AudioTracks {
+			if _, ok := vc.audioSender[id+"-"+kind]; ok {
+				continue
+			}
+			aSender, err := vc.pc.AddTrack(al)
+			if err != nil {
+				log.Printf("subscribe: 音频 AddTrack 失败 viewer=%s stream=%s kind=%s: %v", viewerID, id, kind, err)
+				continue
+			}
+			vc.audioSender[id+"-"+kind] = aSender
+			changed = true
+			logV("subscribe: %s 订阅流 %s 音频(%s)", viewerID, id, kind)
+		}
+	}
+	s.mu.Unlock()
+	if changed {
+		vc.negotiate()
+		// 通知所有共享者观看人数变化
+		for id := range s.streams {
+			if id != viewerID {
+				s.broadcastWatchers(id)
+			}
+		}
+	}
+	s.hub.syncSubscribeToNeighbors() // 按需转发：本地观看者数量变化通知邻居
+}
+
+func (s *SFU) ensureAllSubscribers() {
+	s.mu.Lock()
+	ids := make([]string, 0, len(s.viewers))
+	for id := range s.viewers {
+		ids = append(ids, id)
+	}
+	s.mu.Unlock()
+	for _, id := range ids {
+		s.ensureSubscriber(id)
+	}
+}
+
+// resetSubscriber 订阅连接 ICE 失败时重建（前端 resubscribe 触发；P2P 会话独立不受影响）
+func (s *SFU) resetSubscriber(viewerID string) {
+	s.mu.Lock()
+	vc := s.viewers[viewerID]
+	if vc == nil {
+		s.mu.Unlock()
+		return
+	}
+	if vc.pc != nil {
+		vc.pc.Close()
+	}
+	delete(s.viewers, viewerID)
+	s.mu.Unlock()
+	s.ensureSubscriber(viewerID)
+}
+
+// forwardPLI 把观看者发来的关键帧请求转发给共享者（按当前档位的 SSRC 改写）
+func (s *SFU) forwardPLI(vc *viewerConn, streamID string, sender *webrtc.RTPSender, st *stream) {
+	for {
+		pkts, _, err := sender.ReadRTCP()
+		if err != nil {
+			return
+		}
+		s.mu.Lock()
+		rid := vc.tiers[streamID]
+		remote := st.Remote[rid]
+		srcPC := st.SourcePC
+		var ssrc uint32
+		if remote != nil {
+			ssrc = uint32(remote.SSRC())
+		}
+		s.mu.Unlock()
+		if remote == nil || srcPC == nil {
+			return
+		}
+		for _, pkt := range pkts {
+			if pli, ok := pkt.(*rtcp.PictureLossIndication); ok {
+				pli.MediaSSRC = ssrc
+				if srcPC.ConnectionState() == webrtc.PeerConnectionStateConnected {
+					srcPC.WriteRTCP([]rtcp.Packet{pli}) //nolint:errcheck
+				}
+			}
+		}
+	}
+}
+
+// streamKeeper 流保活：每秒向源发 REMB（Safari 收不到接收端带宽反馈时会暂停视频帧，音频不受影响），
+// 每 2 秒发一次 PLI（关键帧保底，覆盖推流端偶发漏发关键帧的场景）。流移除或源连接断开即退出。
+func (s *SFU) streamKeeper(st *stream) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	ticks := 0
+	for range ticker.C {
+		s.mu.Lock()
+		cur := s.streams[st.ID]
+		if cur == nil || cur.SourcePC == nil || cur.SourcePC.ConnectionState() != webrtc.PeerConnectionStateConnected || len(cur.Remote) == 0 {
+			s.mu.Unlock()
+			return
+		}
+		ssrcs := make([]uint32, 0, len(cur.Remote))
+		var first uint32
+		for _, r := range cur.Remote {
+			ssrc := uint32(r.SSRC())
+			ssrcs = append(ssrcs, ssrc)
+			if first == 0 {
+				first = ssrc
+			}
+		}
+		pc := cur.SourcePC
+		s.mu.Unlock()
+		pc.WriteRTCP([]rtcp.Packet{&rtcp.ReceiverEstimatedMaximumBitrate{Bitrate: 30_000_000, SSRCs: ssrcs}}) //nolint:errcheck
+		ticks++
+		if ticks%2 == 0 {
+			pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: first}}) //nolint:errcheck
+		}
+	}
+}
+
+// negotiate 服务器侧发起（重）协商，串行保证一次一个 offer；
+// 有在途 offer（have-local-offer）时标记待办，answer 完成后补发，避免洪泛
+func (vc *viewerConn) negotiate() {
+	select {
+	case vc.negCh <- struct{}{}:
+	default:
+		return
+	}
+	defer func() { <-vc.negCh }()
+
+	if vc.pc.SignalingState() != webrtc.SignalingStateStable {
+		vc.pmu.Lock()
+		vc.pending = true
+		vc.pmu.Unlock()
+		return
+	}
+	vc.pmu.Lock()
+	vc.pending = false
+	vc.pmu.Unlock()
+
+	offer, err := vc.pc.CreateOffer(nil)
+	if err != nil {
+		log.Printf("negotiate: CreateOffer 失败 %s: %v", vc.peer.id, err)
+		return
+	}
+	if err := vc.pc.SetLocalDescription(offer); err != nil {
+		log.Printf("negotiate: SetLocalDescription 失败 %s: %v", vc.peer.id, err)
+		return
+	}
+	// 附带流映射（id -> SSRC）供前端统计按 SSRC 匹配
+	streams := make([]map[string]any, 0, len(vc.senders))
+	for sid, sender := range vc.senders {
+		ssrc := uint32(0)
+		if params := sender.GetParameters(); len(params.Encodings) > 0 {
+			ssrc = uint32(params.Encodings[0].SSRC)
+		}
+		streams = append(streams, map[string]any{"id": sid, "ssrc": ssrc})
+	}
+	logV("negotiate: 发送 subscribe-offer 给 %s (流 %d)", vc.peer.id, len(streams))
+	sendMsg(vc.peer, map[string]any{"type": "subscribe-offer", "sdp": vc.pc.LocalDescription(), "streams": streams})
+}
+
+func (p *peer) handleSubscribeAnswer(m map[string]any) {
+	vc := p.hub.sfu.viewers[p.id]
+	if vc == nil {
+		return
+	}
+	sd, _ := m["sdp"].(map[string]any)
+	sdpStr, _ := sd["sdp"].(string)
+	if sdpStr == "" {
+		return
+	}
+	vc.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: sdpStr}) //nolint:errcheck
+	// answer 完成后补发积压的协商请求（新流/切层等）
+	vc.pmu.Lock()
+	pending := vc.pending
+	vc.pending = false
+	vc.pmu.Unlock()
+	if pending && vc.pc.SignalingState() == webrtc.SignalingStateStable {
+		go vc.negotiate()
+	}
+}
+
+func (p *peer) handleCandidate(m map[string]any) {
+	pcType, _ := m["pc"].(string)
+	cand, _ := m["candidate"].(map[string]any)
+	if cand == nil {
+		return
+	}
+	c := webrtc.ICECandidateInit{}
+	if v, ok := cand["candidate"].(string); ok {
+		c.Candidate = v
+	}
+	if v, ok := cand["sdpMid"].(string); ok {
+		c.SDPMid = &v
+	}
+	if v, ok := cand["sdpMLineIndex"].(float64); ok {
+		i := uint16(v)
+		c.SDPMLineIndex = &i
+	}
+	switch pcType {
+	case "publish":
+		p.mu.Lock()
+		pc := p.pubPC
+		p.mu.Unlock()
+		if pc != nil {
+			pc.AddICECandidate(c) //nolint:errcheck
+		}
+	case "camera":
+		p.mu.Lock()
+		pc := p.camPC
+		p.mu.Unlock()
+		if pc != nil {
+			pc.AddICECandidate(c) //nolint:errcheck
+		}
+	case "audio", "audio-mic", "audio-system":
+		kind := "audio"
+		if pcType == "audio-mic" {
+			kind = "mic"
+		} else if pcType == "audio-system" {
+			kind = "system"
+		}
+		p.mu.Lock()
+		pc := p.audioPubPCs[kind]
+		p.mu.Unlock()
+		if pc != nil {
+			pc.AddICECandidate(c) //nolint:errcheck
+		}
+	case "subscribe":
+		vc := p.hub.sfu.viewers[p.id]
+		if vc != nil {
+			vc.pc.AddICECandidate(c) //nolint:errcheck
+		}
+	}
+}
+
+// handleShareConfig 记录并广播共享者的编码配置（供接收端判断解码受限）
+func (p *peer) handleShareConfig(m map[string]any) {
+	h := p.hub
+	h.sfu.mu.Lock()
+	_, hasStream := h.sfu.streams[p.id]
+	h.sfu.mu.Unlock()
+	if !hasStream {
+		return
+	}
+	cfg := map[string]any{
+		"frameRate": m["frameRate"],
+		"bitrate":   m["bitrate"],
+		"width":     m["width"],
+		"height":    m["height"],
+	}
+	h.mu.Lock()
+	if h.streamCfgs == nil {
+		h.streamCfgs = make(map[string]map[string]any)
+	}
+	h.streamCfgs[p.id] = cfg
+	h.mu.Unlock()
+	h.broadcast(map[string]any{
+		"type": "share-config", "ownerId": p.id,
+		"frameRate": cfg["frameRate"], "bitrate": cfg["bitrate"],
+		"width": cfg["width"], "height": cfg["height"],
+	})
+	h.forwardShareConfigToNodes(p.id, cfg)
+}
+
+// forwardShareConfigToNodes 把编码配置转发给邻居（远端清晰度判定用）
+func (h *hub) forwardShareConfigToNodes(ownerID string, cfg map[string]any) {
+	h.mu.Lock()
+	links := make([]*nodeLink, 0, len(h.nodes))
+	for _, nl := range h.nodes {
+		links = append(links, nl)
+	}
+	h.mu.Unlock()
+	for _, nl := range links {
+		nl.sendMsg(map[string]any{"type": "node-share-config", "ownerId": ownerID, "config": cfg})
+	}
+}
+
+func (p *peer) handleViewerConfig(m map[string]any) {
+	streamID, _ := m["streamId"].(string)
+	tier, _ := m["tier"].(string)
+	s := p.hub.sfu
+
+	s.mu.Lock()
+	vc := s.viewers[p.id]
+	st := s.streams[streamID]
+	if vc == nil || st == nil {
+		s.mu.Unlock()
+		return
+	}
+	newLocal := st.Layers[tier]
+	if newLocal == nil {
+		newLocal = st.Layers["l"] // 目标层未就绪时回退默认档位（流畅）
+	}
+	oldSender := vc.senders[streamID]
+	if oldSender == nil || newLocal == nil {
+		s.mu.Unlock()
+		return
+	}
+	// 重协商切层：移除旧层 + 添加新层。新层随协商获得新 SSRC（写入 SDP），
+	// Chrome 将其视为新流正常解码，避免同 SSRC 时间戳跳变导致的持续丢包。
+	if err := vc.pc.RemoveTrack(oldSender); err != nil {
+		log.Printf("viewer-config: RemoveTrack 失败 viewer=%s stream=%s: %v", p.id, streamID, err)
+		s.mu.Unlock()
+		return
+	}
+	oldSender.Stop()
+	newSender, err := vc.pc.AddTrack(newLocal)
+	if err != nil {
+		log.Printf("viewer-config: AddTrack 失败 viewer=%s stream=%s tier=%s: %v", p.id, streamID, tier, err)
+		s.mu.Unlock()
+		return
+	}
+	vc.senders[streamID] = newSender
+	vc.tiers[streamID] = tier
+	go s.forwardPLI(vc, streamID, newSender, st)
+	remote := st.Remote[tier]
+	srcPC := st.SourcePC
+	var ssrc uint32
+	if remote != nil {
+		ssrc = uint32(remote.SSRC())
+	}
+	s.mu.Unlock()
+
+	// 向源请求关键帧：重协商完成后新层关键帧已就绪，画面更快恢复
+	if remote != nil && srcPC != nil && srcPC.ConnectionState() == webrtc.PeerConnectionStateConnected {
+		srcPC.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: ssrc}}) //nolint:errcheck
+	}
+	vc.negotiate()
+}
+
+func (p *peer) handleChat(m map[string]any) {
+	h := p.hub
+	text, _ := m["text"].(string)
+	fileId, _ := m["fileId"].(string)
+	fileName, _ := m["fileName"].(string)
+	fileType, _ := m["fileType"].(string)
+	if text == "" && fileId == "" {
+		return
+	}
+	// 按字符数截断（2000 字符；[]rune 避免中文按字节截断导致显示少于 2000）
+	runes := []rune(text)
+	if len(runes) > 2000 {
+		text = string(runes[:2000])
+	}
+	msg := map[string]any{
+		"type": "chat",
+		"from": p.id, "fromName": p.name, "color": p.color,
+		"text": text, "ts": time.Now().UnixMilli(),
+		"fileId": fileId, "fileName": fileName, "fileType": fileType,
+	}
+	h.appendChat(msg)
+	h.forwardChatToNodes(msg)
+}
+
+// appendChat 本地广播 + 写入聊天历史（含历史截断与文件缓存清理）
+func (h *hub) appendChat(msg map[string]any) {
+	h.mu.Lock()
+	h.chatHist = append(h.chatHist, msg)
+	if len(h.chatHist) > 100 {
+		// 超上限：截断最旧消息，并清理不再被历史引用的文件缓存（小文件随数量上限清理）
+		removed := h.chatHist[:len(h.chatHist)-100]
+		h.chatHist = h.chatHist[len(h.chatHist)-100:]
+		for _, rm := range removed {
+			fid, _ := rm["fileId"].(string)
+			if fid == "" {
+				continue
+			}
+			stillUsed := false
+			for _, m2 := range h.chatHist {
+				if f2, _ := m2["fileId"].(string); f2 == fid {
+					stillUsed = true
+					break
+				}
+			}
+			if !stillUsed {
+				if cf, ok := h.chatFiles[fid]; ok {
+					h.chatTotalB -= len(cf.data)
+				}
+				delete(h.chatFiles, fid)
+			}
+		}
+	}
+	h.mu.Unlock()
+	h.broadcast(msg) // 含发送者：前端统一渲染，不做本地回显
+}
+
+// forwardChatToNodes 把聊天消息转发给所有邻居节点（跨节点互通）
+func (h *hub) forwardChatToNodes(msg map[string]any) {
+	h.mu.Lock()
+	links := make([]*nodeLink, 0, len(h.nodes))
+	for _, nl := range h.nodes {
+		links = append(links, nl)
+	}
+	h.mu.Unlock()
+	for _, nl := range links {
+		nl.sendMsg(map[string]any{"type": "node-chat", "msg": msg})
+	}
+}
+
+// ---------- 聊天文件（内存缓存，重启清空，60 分钟过期清理） ----------
+
+const chatFileMaxSize = 100 << 20  // 单文件 100MB
+const chatBigFileSize = 20 << 20   // 大文件阈值：>20MB 按 60 分钟清理；≤20MB 随聊天历史上限清理
+const chatFileTotalMax = 200 << 20 // 总文件缓存上限 200MB：超限时新上传清理最旧文件
+
+// handleChatFileUpload POST /api/chat-file：multipart 字段 file，返回 {id, mime, name}
+func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, chatFileMaxSize+1<<20)
+	if err := r.ParseMultipartForm(chatFileMaxSize); err != nil {
+		http.Error(w, "文件过大或解析失败（≤20MB）", http.StatusBadRequest)
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "缺少 file 字段", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil || len(data) == 0 || len(data) > chatFileMaxSize {
+		http.Error(w, "文件读取失败或超过 20MB", http.StatusBadRequest)
+		return
+	}
+	id := randomCred(8)
+	h.mu.Lock()
+	h.chatFiles[id] = &chatFile{data: data, mime: header.Header.Get("Content-Type"), name: header.Filename, at: time.Now(), big: len(data) > chatBigFileSize}
+	h.chatTotalB += len(data)
+	// 总缓存超上限：按最旧优先删除（保留新文件），直到放下
+	need := h.chatTotalB
+	if need > chatFileTotalMax {
+		type item struct {
+			id string
+			at time.Time
+		}
+		var items []item
+		for fid, cf := range h.chatFiles {
+			items = append(items, item{fid, cf.at})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].at.Before(items[j].at) }) // 最旧在前
+		for _, it := range items {
+			if it.id == id {
+				continue // 保留新文件
+			}
+			sz := len(h.chatFiles[it.id].data)
+			delete(h.chatFiles, it.id)
+			h.chatTotalB -= sz
+			need -= sz
+			log.Printf("chat-file: 缓存超限，清理最旧 %s（%d 字节）", it.id, sz)
+			if need <= chatFileTotalMax {
+				break
+			}
+		}
+	}
+	h.mu.Unlock()
+	log.Printf("chat-file: %s 上传 %s (%d 字节)", pname(r), header.Filename, len(data))
+	json.NewEncoder(w).Encode(map[string]any{"id": id, "mime": header.Header.Get("Content-Type"), "name": header.Filename})
+}
+
+func pname(r *http.Request) string {
+	if hstr, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return hstr
+	}
+	return r.RemoteAddr
+}
+
+// handleChatFileGet GET /api/chat-file/{id}
+func (h *hub) handleChatFileGet(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/api/chat-file/")
+	if id == "" {
+		http.Error(w, "missing id", http.StatusBadRequest)
+		return
+	}
+	h.mu.Lock()
+	cf := h.chatFiles[id]
+	h.mu.Unlock()
+	if cf == nil {
+		// 本节点无缓存：尝试从源节点跨节点拉取
+		h.mu.Lock()
+		src := h.fileRoute[id]
+		h.mu.Unlock()
+		if src != "" {
+			cf = h.fetchRemoteFile(id, src)
+		}
+	}
+	if cf == nil {
+		http.Error(w, "文件不存在或已过期", http.StatusNotFound)
+		return
+	}
+	cd := `inline` // 图片/视频内联预览播放；其余附件下载
+	if !strings.HasPrefix(cf.mime, "image/") && !strings.HasPrefix(cf.mime, "video/") {
+		cd = `attachment`
+	}
+	w.Header().Set("Content-Type", cf.mime)
+	w.Header().Set("Content-Disposition", cd+`; filename="`+strings.ReplaceAll(cf.name, `"`, `_`)+`"`)
+	w.Write(cf.data)
+}
+
+// chatFileCleanup 定时清理过期的大文件（60 分钟）；小文件随聊天历史上限（100 条）截断清理
+func (h *hub) chatFileCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	for range ticker.C {
+		cutoff := time.Now().Add(-60 * time.Minute)
+		h.mu.Lock()
+		for id, cf := range h.chatFiles {
+			if cf.big && cf.at.Before(cutoff) {
+				h.chatTotalB -= len(cf.data)
+				delete(h.chatFiles, id)
+			}
+		}
+		h.mu.Unlock()
+	}
+}
+
+// ---------- 链接预览（OG 元数据，供聊天链接卡片展示） ----------
+
+// GET /api/link-preview?url=...：抓取目标页 og:title/og:description/og:image（回退 <title>）
+func (h *hub) handleLinkPreview(w http.ResponseWriter, r *http.Request) {
+	url := r.URL.Query().Get("url")
+	if url == "" || (!strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://")) {
+		http.Error(w, "invalid url", http.StatusBadRequest)
+		return
+	}
+	client := &http.Client{Timeout: 8 * time.Second}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]any{})
+		return
+	}
+	// 模拟浏览器请求：无 UA 会被 B站等站点拒绝/返回错误页
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	resp, err := client.Do(req)
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]any{})
+		return
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
+	if err != nil {
+		json.NewEncoder(w).Encode(map[string]any{})
+		return
+	}
+	html := string(body)
+	// 通用 meta 解析：property/name 两种属性 + 两种属性顺序 + 多值回退
+	meta := func(attr string, values ...string) string {
+		for _, v := range values {
+			re1 := regexp.MustCompile(`<meta[^>]+` + attr + `=["']` + v + `["'][^>]+content=["']([^"']*)["']`)
+			if m := re1.FindStringSubmatch(html); len(m) > 1 {
+				return htmlUnescape(m[1])
+			}
+			re2 := regexp.MustCompile(`<meta[^>]+content=["']([^"']*)["'][^>]+` + attr + `=["']` + v + `["']`)
+			if m := re2.FindStringSubmatch(html); len(m) > 1 {
+				return htmlUnescape(m[1])
+			}
+		}
+		return ""
+	}
+	// 标题回退链：og:title → twitter:title → <title>
+	title := meta("property", "og:title")
+	if title == "" {
+		title = meta("name", "og:title", "twitter:title")
+	}
+	if title == "" {
+		re := regexp.MustCompile(`<title[^>]*>([^<]*)</title>`)
+		if m := re.FindStringSubmatch(html); len(m) > 1 {
+			title = htmlUnescape(m[1])
+		}
+	}
+	// 描述回退链：og:description → name=description（国内站常用） → twitter:description
+	desc := meta("property", "og:description")
+	if desc == "" {
+		desc = meta("name", "og:description", "description", "twitter:description")
+	}
+	// 缩略图回退链：og:image → twitter:image → <link rel="image_src">
+	image := meta("property", "og:image")
+	if image == "" {
+		image = meta("name", "og:image", "twitter:image")
+	}
+	if image == "" {
+		re := regexp.MustCompile(`<link[^>]+rel=["']image_src["'][^>]+href=["']([^"']*)["']`)
+		if m := re.FindStringSubmatch(html); len(m) > 1 {
+			image = htmlUnescape(m[1])
+		}
+	}
+	// og:image 相对地址补全协议
+	if image != "" && strings.HasPrefix(image, "//") {
+		image = "https:" + image
+	} else if image != "" && strings.HasPrefix(image, "/") {
+		if u, err := neturl.Parse(url); err == nil {
+			image = u.Scheme + "://" + u.Host + image
+		}
+	}
+	if len([]rune(title)) > 200 {
+		title = string([]rune(title)[:200])
+	}
+	if len([]rune(desc)) > 400 {
+		desc = string([]rune(desc)[:400])
+	}
+	json.NewEncoder(w).Encode(map[string]any{"title": title, "desc": desc, "image": image})
+}
+
+// htmlUnescape 简单反转义（HTML 实体 → 文本）
+func htmlUnescape(s string) string {
+	repl := strings.NewReplacer(
+		"&amp;", "&", "&lt;", "<", "&gt;", ">",
+		"&quot;", `"`, "&#39;", "'", "&#x27;", "'", "&#x2F;", "/",
+	)
+	return repl.Replace(s)
+}
+
+// removeAllStreams 删除共享者的全部流（视频流 + 独立音频流），并通知所有观看者移除
+func (s *SFU) removeAllStreams(ownerID string) {
+	// 视频流
+	s.removeStreamVideo(ownerID, nil)
+	// 摄像头流（ownerID-cam）
+	s.removeStreamVideo(ownerID+"-cam", nil)
+	// 独立音频流（ownerID-a）
+	s.removeAudioStreamAll(ownerID)
+}
+
+// removeAudioStreamAll 删除共享者的整个音频流（全部通道）
+func (s *SFU) removeAudioStreamAll(ownerID string) {
+	streamID := ownerID + "-a"
+	s.mu.Lock()
+	st := s.streams[streamID]
+	if st == nil {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.streams, streamID)
+	toNegotiate := make([]*viewerConn, 0)
+	for _, vc := range s.viewers {
+		for key, aSender := range vc.audioSender {
+			if len(key) > len(streamID) && key[:len(streamID)+1] == streamID+"-" {
+				vc.pc.RemoveTrack(aSender) //nolint:errcheck
+				aSender.Stop()
+				delete(vc.audioSender, key)
+				toNegotiate = append(toNegotiate, vc)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, vc := range toNegotiate {
+		vc.negotiate()
+	}
+	s.hub.broadcast(map[string]any{"type": "stream-removed", "id": streamID, "ownerId": ownerID})
+	s.broadcastWatchers(ownerID)
+	if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
+		s.hub.nodeStreamRemoved(ownerID, "all")
+	}
+}
+
+// removeStreamVideo 移除共享者的视频流（屏幕共享停止；音频为独立流，不受影响）。
+// sourcePC 非空时校验来源连接：流不是该连接产生的则跳过（编码热切换后旧连接断开事件晚于新 offer，
+// 避免误删新连接刚建立的流）；sourcePC 为 nil 表示无条件移除（停止共享/断线清理）
+func (s *SFU) removeStreamVideo(ownerID string, sourcePC *webrtc.PeerConnection) {
+	s.mu.Lock()
+	st := s.streams[ownerID]
+	if st == nil {
+		s.mu.Unlock()
+		return
+	}
+	if sourcePC != nil && st.SourcePC != nil && st.SourcePC != sourcePC {
+		s.mu.Unlock()
+		return // 不是该连接产生的流：跳过（热切换竞态保护）
+	}
+	delete(s.streams, ownerID)
+	toNegotiate := make([]*viewerConn, 0)
+	for _, vc := range s.viewers {
+		if sender, ok := vc.senders[ownerID]; ok {
+			vc.pc.RemoveTrack(sender) //nolint:errcheck
+			sender.Stop()
+			delete(vc.senders, ownerID)
+			delete(vc.tiers, ownerID)
+			toNegotiate = append(toNegotiate, vc)
+		}
+	}
+	srcPC := st.SourcePC
+	s.mu.Unlock()
+	if srcPC != nil {
+		srcPC.Close()
+	}
+	for _, vc := range toNegotiate {
+		vc.negotiate()
+	}
+	s.hub.broadcast(map[string]any{"type": "stream-removed", "id": ownerID, "ownerId": ownerID})
+	s.broadcastWatchers(ownerID)
+	if !s.hub.isProxyStream(st) { // 代理流移除不转发（源节点自行管理，防回环）
+		h := s.hub
+		if strings.HasSuffix(ownerID, "-cam") {
+			h.nodeStreamRemoved(strings.TrimSuffix(ownerID, "-cam"), "cam")
+		} else {
+			h.nodeStreamRemoved(ownerID, "video")
+		}
+	}
+	log.Printf("removeStreamVideo: %s 视频流移除（音频独立流保留）", ownerID)
+}
+
+// removeStreamAudio 移除共享者的音频（仅音频共享时整个流移除；有视频时仅移除音频轨）
+func (s *SFU) removeStreamAudio(ownerID string, kind string) {
+	if kind == "" {
+		kind = "audio"
+	}
+	streamID := ownerID + "-a"
+	s.mu.Lock()
+	st := s.streams[streamID]
+	if st == nil {
+		s.mu.Unlock()
+		return
+	}
+	// 移除指定通道
+	if st.AudioTracks != nil {
+		delete(st.AudioTracks, kind)
+		delete(st.AudioRemotes, kind)
+	}
+	hasAudio := len(st.AudioTracks) > 0
+	if !hasAudio {
+		// 无剩余音频通道：删除整个音频流
+		delete(s.streams, streamID)
+		toNegotiate := make([]*viewerConn, 0)
+		for _, vc := range s.viewers {
+			for key, aSender := range vc.audioSender {
+				if len(key) > len(streamID) && key[:len(streamID)+1] == streamID+"-" {
+					vc.pc.RemoveTrack(aSender) //nolint:errcheck
+					aSender.Stop()
+					delete(vc.audioSender, key)
+					toNegotiate = append(toNegotiate, vc)
+				}
+			}
+		}
+		s.mu.Unlock()
+		for _, vc := range toNegotiate {
+			vc.negotiate()
+		}
+		s.hub.broadcast(map[string]any{"type": "stream-removed", "id": streamID, "ownerId": ownerID})
+		s.broadcastWatchers(ownerID)
+		if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
+			s.hub.nodeStreamRemoved(ownerID, kind)
+		}
+		return
+	}
+	// 有剩余通道：仅移除该通道
+	toNegotiate := make([]*viewerConn, 0)
+	key := streamID + "-" + kind
+	for _, vc := range s.viewers {
+		if aSender, ok := vc.audioSender[key]; ok {
+			vc.pc.RemoveTrack(aSender) //nolint:errcheck
+			aSender.Stop()
+			delete(vc.audioSender, key)
+			toNegotiate = append(toNegotiate, vc)
+		}
+	}
+	s.mu.Unlock()
+	for _, vc := range toNegotiate {
+		vc.negotiate()
+	}
+	s.hub.broadcast(map[string]any{"type": "stream-audio-removed", "id": streamID, "ownerId": ownerID, "kind": kind})
+	if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
+		s.hub.nodeStreamRemoved(ownerID, kind)
+	}
+}
+
+func (s *SFU) removeViewer(viewerID string) {
+	s.mu.Lock()
+	vc := s.viewers[viewerID]
+	if vc != nil {
+		delete(s.viewers, viewerID)
+		subscribed := make([]string, 0, len(vc.senders))
+		for id := range vc.senders {
+			subscribed = append(subscribed, id)
+		}
+		vc.pc.Close()
+		s.mu.Unlock()
+		for _, id := range subscribed {
+			s.broadcastWatchers(id)
+		}
+		s.hub.syncSubscribeToNeighbors() // 按需转发：本地观看者数量变化通知邻居
+		return
+	}
+	s.mu.Unlock()
+}
+
+func (h *hub) unregister(p *peer) {
+	h.mu.Lock()
+	if h.peers[p.id] != p {
+		// 身份已被顶替或不存在：仅清理自身连接与身份映射
+		if p.clientID != "" && h.clientIDs[p.clientID] == p {
+			delete(h.clientIDs, p.clientID)
+		}
+		if !p.closed {
+			p.closed = true
+			close(p.send)
+		}
+		h.mu.Unlock()
+		return
+	}
+	delete(h.peers, p.id)
+	delete(h.streamCfgs, p.id)
+	if p.clientID != "" && h.clientIDs[p.clientID] == p {
+		delete(h.clientIDs, p.clientID)
+	}
+	if !p.closed {
+		p.closed = true
+		close(p.send)
+	}
+	p.mu.Lock()
+	pub := p.pubPC
+	p.pubPC = nil
+	cam := p.camPC
+	p.camPC = nil
+	audioPubs := p.audioPubPCs
+	p.audioPubPCs = nil
+	p.mu.Unlock()
+	h.mu.Unlock()
+
+	h.ctrlCleanup(p.id)      // 远程控制会话清理（被控端/控制者/待确认请求）
+	h.logUnsubscribeID(p.id) // 日志窗口订阅清理
+
+	if pub != nil {
+		pub.Close()
+	}
+	if cam != nil {
+		cam.Close()
+	}
+	for _, ap := range audioPubs {
+		ap.Close()
+	}
+	// 被顶替的旧连接：资源已在顶替时清理，跳过 peer-left 广播（避免身份抖动）
+	if p.replaced {
+		return
+	}
+	h.sfu.removeAllStreams(p.id)
+	h.sfu.removeViewer(p.id)
+	h.broadcast(map[string]any{"type": "peer-left", "id": p.id})
+	h.broadcastTopo()                // 本节点子用户变化（拓扑图刷新）
+	h.forwardPeerRemoveToNodes(p.id) // 跨节点同步：本节点用户离开
+}
+
+func sendMsg(p *peer, m map[string]any) {
+	if p == nil || p.conn == nil { // 虚拟 peer（远端节点用户）不走浏览器通道
+		return
+	}
+	data, err := json.Marshal(m)
+	if err != nil {
+		return
+	}
+	select {
+	case p.send <- data:
+	default:
+	}
+}
