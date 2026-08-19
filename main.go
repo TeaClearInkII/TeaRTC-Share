@@ -136,6 +136,8 @@ func main() {
 	mux.HandleFunc("/node-ws", h.serveNodeWS)
 	mux.HandleFunc("/api/join", h.handleJoin)
 	mux.HandleFunc("/api/join-token", h.handleJoinToken)
+	mux.HandleFunc("/api/node-state", h.handleNodeState)
+	mux.HandleFunc("/api/disconnect", h.handleDisconnect)
 	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin == "" {
@@ -198,6 +200,7 @@ func main() {
 		}
 		log.Printf(" IPv6 出站可用:  %v", boolTxt(ipv6Info.Route))
 		log.Println(" 公网 IPv6 检测:  后台进行中（可在页面「关于」查看主机网络状态）")
+		log.Println(" 浏览端也需开启 IPv6 才能通过 IPv6 访问（可在页面「关于」复制提示给对方）")
 	} else {
 		log.Println(" !! 未检测到可用的全局 IPv6 地址，请检查网络")
 	}
@@ -720,6 +723,7 @@ type peer struct {
 	ip        string // 连接来源 IP（RemoteAddr，供观看端展示）
 	enterHost string // 进入页面的 URL 主机（前端 location.hostname 上报，供观看端展示服务地址）
 	hostId    string // 所属节点的服务运行者 peer id（多节点互联：该用户所在节点的服务用户）
+	joinedAt  int64  // 加入时刻（Unix 毫秒；供前端在线时长徽章，peer.mu 保护）
 	rttMs     int64  // 该用户到其所在主机的延迟（服务器 ping 测量，peer.mu 保护）
 	lastPong  int64  // 最近一次收到 pong 的时间戳（死连接探测，peer.mu 保护）
 
@@ -843,7 +847,7 @@ func (h *hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	p := &peer{hub: h, conn: conn, send: make(chan []byte, 32), host: isHostConn(r), ip: clientIP(r)}
+	p := &peer{hub: h, conn: conn, send: make(chan []byte, 32), host: isHostConn(r), ip: clientIP(r), joinedAt: time.Now().UnixMilli()}
 	go p.writeLoop()
 	p.readLoop()
 }
@@ -1245,7 +1249,7 @@ func (h *hub) broadcastExcept(except *peer, m map[string]any) {
 }
 
 func (h *hub) peerInfo(p *peer) map[string]any {
-	return map[string]any{"id": p.id, "name": p.name, "color": p.color, "sharing": p.sharing(), "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId}
+	return map[string]any{"id": p.id, "name": p.name, "color": p.color, "sharing": p.sharing(), "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId, "joinedAt": p.joinedAt}
 }
 
 func (p *peer) handleHello(m map[string]any) {
@@ -1264,6 +1268,7 @@ func (p *peer) handleHello(m map[string]any) {
 		p.clientID = clientID
 		p.id = old.id
 		p.color = old.color
+		p.joinedAt = old.joinedAt // 刷新/重连沿用原在线时长（不算重新加入）
 		h.peers[p.id] = p
 		h.clientIDs[clientID] = p
 		h.mu.Unlock()
@@ -1361,7 +1366,7 @@ func (p *peer) handleHello(m map[string]any) {
 	h.sfu.mu.Unlock()
 
 	sendMsg(p, map[string]any{"type": "welcome", "id": p.id, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "peers": peers, "streams": streams})
-	h.broadcastExcept(p, map[string]any{"type": "peer-joined", "id": p.id, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId})
+	h.broadcastExcept(p, map[string]any{"type": "peer-joined", "id": p.id, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId, "joinedAt": p.joinedAt})
 	if hostUpdated {
 		// host 上线（含晚于他人加入）：广播补填，前端将 hostId 为空的用户指向该服务运行者
 		h.broadcastExcept(p, map[string]any{"type": "host-updated", "id": p.id, "name": p.name})

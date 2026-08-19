@@ -30,7 +30,7 @@
     background: #1d2636; color: #dde3ee; border: 1px solid #2a3650;
     border-radius: 6px; padding: 5px 10px; font-size: 13px; width: 160px;
   }
-  .grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .grid { max-width: 1400px; margin: 0 auto; display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: 14px; }
   .pcard {
     background: #161d2e; border: 1px solid #232e45; border-radius: 16px;
     overflow: hidden; display: flex; flex-direction: column; position: relative;
@@ -146,10 +146,13 @@
     position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.6);
     display: flex; align-items: center; justify-content: center;
   }
+  #ctrlApplyModal { z-index: 500; } /* 询问弹窗从上级弹窗内触发，需置顶 */
   .modal[hidden] { display: none; }
   .modalBox {
     background: #161d2e; border: 1px solid #232e45; border-radius: 14px;
     padding: 16px 18px; width: 440px; max-width: 92vw;
+    max-height: 88vh; overflow-y: auto; /* 内容超出窗口时滚动自适应 */
+    overflow-wrap: anywhere; /* 长文本自动换行，避免横向滚动 */
   }
   #chatPanel {
     position: fixed; right: 0; top: 0; bottom: 0; width: 320px; max-width: 92vw;
@@ -209,7 +212,7 @@
   .linkTitle { font-size: 13px; color: #60a5fa; font-weight: 600; word-break: break-all; }
   .linkDesc { font-size: 11px; color: #8fa3c4; margin-top: 2px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-all; }
   .chatTime { font-size: 10px; color: #5b6b86; margin-left: 6px; }
-  .modalHead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .modalHead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-wrap: wrap; gap: 8px; }
   .modalHead span { font-size: 15px; font-weight: 600; }
   .modalHead.center { justify-content: center; position: relative; }
   .modalHead.center span { flex: 1; text-align: center; }
@@ -240,8 +243,14 @@
     font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
   }
   #verBanner[hidden] { display: none; }
+  #proxyBanner {
+    max-width: 1400px; margin: 0 auto 10px;
+    background: #1e3a8a; color: #bfdbfe; padding: 8px 14px; border-radius: 10px;
+    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  }
+  #proxyBanner[hidden] { display: none; }
   .aboutBody { display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
-  .aboutRow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .aboutRow { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
   .aboutRow > span:first-child { color: #8fa3c4; flex: none; }
   .aboutRow .hint { color: #8fa3c4; }
   .aboutAuthor { text-align: center; font-weight: 600; font-size: 14px; }
@@ -316,7 +325,7 @@
     padding: 4px; display: flex;
   }
   #cinemaControls .ctrl.on { color: #60a5fa; border-color: #60a5fa; }
-  .netItem { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(255,255,255,0.04); margin-bottom: 6px; font-size: 13px; }
+  .netItem { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(255,255,255,0.04); margin-bottom: 6px; font-size: 13px; flex-wrap: wrap; }
   .inviteRow { display: flex; margin-bottom: 6px; }
   .inviteRow .btn { font-size: 12px; }
   #logBody {
@@ -341,7 +350,7 @@
   #netTopo .topoUser circle { fill: #cbd5e1; stroke: none; }
   #netTopo .topoUser.self circle { fill: #fbbf24; }
   #netTopo .topoUser.self .glow { fill: none; stroke: rgba(251,191,36,0.5); stroke-width: 3; }
-  #netAction { min-height: 30px; display: flex; align-items: center; gap: 10px; font-size: 13px; }
+  #netAction { min-height: 30px; display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -351,14 +360,14 @@
   <span class="badge" id="meBadge"></span>
   <button class="btn mini iconbtn" id="btnNameCfg" title="设置昵称"></button>
   <button class="btn mini iconbtn" id="btnNet" title="多主机互联"></button>
-  <button class="btn mini iconbtn" id="btnAbout" title="关于"></button>
-  <button class="btn mini iconbtn" id="btnLog" title="服务器日志"></button>
   <button class="btn mini iconbtn" id="btnShareAddr" title="分享观看地址"></button>
   <button class="btn mini iconbtn" id="btnFirewall" title="防火墙与 CA 证书"></button>
   <span style="position:relative">
     <button class="btn mini iconbtn" id="btnChat" title="聊天"></button>
     <span id="chatBadge" hidden></span>
   </span>
+  <button class="btn mini iconbtn" id="btnLog" title="服务器日志"></button>
+  <button class="btn mini iconbtn" id="btnAbout" title="关于"></button>
 </header>
 
 <div id="caBanner" hidden>
@@ -375,6 +384,14 @@
 <div id="verBanner" hidden>
   <span>检测到新版本，建议<b>刷新页面</b>以获得最新功能</span>
   <button class="btn mini" id="verRefresh">刷新页面</button>
+</div>
+
+<div id="proxyBanner" hidden>
+  <span>当前通过内网穿透访问（流量受限/限速）</span>
+  <span class="hostBtns">
+    <button class="btn mini" id="proxyBannerSwitch">切换到直连</button>
+    <button class="btn mini" id="proxyBannerClose">关闭</button>
+  </span>
 </div>
 
 <div id="ctrlBanner" hidden>
@@ -477,6 +494,10 @@
       <div class="aboutRow"><span>主机 IPv6 出站</span><span id="aboutIpv6Route">-</span></div>
       <div class="aboutRow"><span>主机公网 IPv6</span><span id="aboutIpv6Public">-</span></div>
       <div class="aboutRow"><span>主机公网 IPv4</span><span id="aboutIpv6Public4">-</span></div>
+      <div class="aboutRow" id="aboutIpv6Hint" style="margin-top:4px"></div>
+      <div class="aboutRow" id="aboutIpv6CopyRow" hidden><button class="btn mini" id="aboutIpv6CopyBtn"></button></div>
+      <div class="aboutRow" style="font-size:11px;color:#9fb3d1"><span>IPv6 检测网站：</span><a href="https://testipv6.cn/" target="_blank" rel="noopener">testipv6.cn</a><span>、</span><a href="https://www.bj-ipv6.com/z/" target="_blank" rel="noopener">bj-ipv6.com</a></div>
+      <div class="aboutRow" style="margin-top:6px"><span style="color:#9fb3d1">不想让用户每次重新输入新的 IPv6？</span><button class="btn mini" id="aboutProxyTut">公网穿透教程</button></div>
       <div class="aboutRow"><span>提示音</span><label style="font-weight:400"><input type="checkbox" id="aboutSound" checked> 启用事件提示音</label></div>
       <div class="aboutRow"><button class="btn mini" id="aboutLogBtn">打开日志窗口</button></div>
       <div id="aboutRefresh" hidden style="margin-top:10px;color:#fde68a">检测到服务器已重启，<button class="btn mini" id="aboutRefreshBtn">刷新页面</button></div>
@@ -496,12 +517,37 @@
   </div>
 </div>
 
+<div id="proxyTutModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(560px,92vw)">
+    <div class="modalHead"><span>公网域名访问教程（内网穿透）</span><button class="btn mini" id="proxyTutClose">×</button></div>
+    <div class="aboutBody" id="proxyTutBody"></div>
+  </div>
+</div>
+
 <div id="shareModal" class="modal" hidden>
   <div class="modalBox" style="min-width:min(520px,92vw)">
     <div class="modalHead"><span>分享观看地址</span><button class="btn mini" id="shareClose">×</button></div>
     <div id="shareList"></div>
+    <div class="aboutRow" id="shareIpv6Hint" style="margin-top:8px;font-size:13px"></div>
+    <div class="aboutRow" id="shareIpv6CopyRow" hidden><button class="btn mini" id="shareIpv6CopyBtn"></button></div>
     <div class="row" style="margin-top:10px">
       <button class="btn primary" id="shareCopyAll" style="flex:1">复制全部</button>
+    </div>
+  </div>
+</div>
+
+<div id="proxyModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(480px,92vw)">
+    <div class="modalHead"><span>检测到通过内网穿透访问</span><button class="btn mini" id="proxyClose">×</button></div>
+    <div class="aboutBody">
+      <p class="hint">当前页面通过内网穿透（樱花、astral 等）访问，连接消耗穿透服务的流量且受带宽限制，画面可能卡顿。</p>
+      <p class="hint">可切换到直连地址：</p>
+      <p id="proxyDirectUrl" class="hint" style="word-break:break-all"></p>
+      <p class="hint">首次直连浏览器会显示证书警告，点击「高级 → 继续前往」即可（需本机网络支持 IPv6）。</p>
+      <div class="row" style="margin-top:10px">
+        <button class="btn primary" id="proxySwitch" style="flex:1">切换到直连</button>
+        <button class="btn mini" id="proxySkip" style="flex:1">继续使用穿透</button>
+      </div>
     </div>
   </div>
 </div>
@@ -681,6 +727,7 @@ let topoVB = null; // 拓扑图当前视图（viewBox），节点/尺寸变化�
 let panState = { on: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 }; // 拖动平移状态
 let pubPC = null, subPC = null;
 let myStream = null, myTrack = null;
+let myStreamStart = 0, myCamStart = 0; const myAudioStart = { mic: 0, system: 0 }; // 自己各共享会话开始时间（徽章时长）
 let iceServers = [], addrList = [], port = 7553;
 let peers = new Map();        // peerId -> info
 let streamOwners = new Map(); // streamId -> ownerId
@@ -697,7 +744,7 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.1.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.2.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
@@ -788,6 +835,25 @@ async function init() {
   $('aboutModal').addEventListener('click', e => { if (e.target === $('aboutModal')) { $('aboutModal').hidden = true; stopAboutTimer(); } });
   $('aboutRefreshBtn').onclick = () => location.reload();
   $('aboutLogBtn').onclick = () => { $('aboutModal').hidden = true; stopAboutTimer(); openLog(); };
+  // 公网穿透教程弹窗（「关于」入口；内容与 README 一致）
+  $('aboutProxyTut').onclick = () => {
+    $('proxyTutBody').innerHTML =
+      '<p class="hint">想让观众不用每次重新输入新的 IPv6 地址？使用内网穿透可获得固定 HTTPS 域名，浏览器打开即用（服务商自动签发可信证书，无需安装 CA）。</p>' +
+      '<p style="font-weight:600;color:#c7d3ea;margin:10px 0 4px">一、为什么用穿透</p>' +
+      '<p class="hint">直连 IPv6：每次换网络/地址都要重新发给观众，且对方必须开启 IPv6。穿透：固定 HTTPS 域名，观众打开即用。</p>' +
+      '<p style="font-weight:600;color:#c7d3ea;margin:10px 0 4px">二、可选工具（均提供公网访问域名）</p>' +
+      '<p class="hint">· <b>樱花穿透 SakuraFrp</b>：国内服务，免费二级域名（如 xxx.natfrp.com）；创建隧道时勾选「可建站」节点；支持绑定自己的域名（自购域名 + CNAME 解析，国内节点需备案），自定义域名支持<b>自动 HTTPS</b>——隧道类型选 TCP，在樱花面板开启自动 HTTPS，证书自动签发续期，无需自己配置。<br>' +
+      '· <b>ngrok</b>：免费注册，临时域名（付费固定域名），HTTPS 自动。<br>' +
+      '· <b>Cloudflare Tunnel</b>（cloudflared）：免费，可绑定自己的域名，HTTPS 自动。<br>' +
+      '· <b>Tailscale Funnel</b>：免费版自带固定 *.ts.net 域名，HTTPS 自动。</p>' +
+      '<p style="font-weight:600;color:#c7d3ea;margin:10px 0 4px">三、通用步骤</p>' +
+      '<p class="hint">1. 注册账号，在服务器安装客户端。<br>2. 创建隧道：协议 HTTPS，目标地址 127.0.0.1:7553。<br>3. 启动后获得 https://xxx 公网域名。<br>4. 把域名发给观众，浏览器直接打开即可（首次访问若提示证书，点「继续前往」）。</p>' +
+      '<p style="font-weight:600;color:#c7d3ea;margin:10px 0 4px">四、注意</p>' +
+      '<p class="hint">· 穿透服务有流量与带宽限制，人多/高画质会卡，适合备用入口。<br>· 服务器（本程序）需保持运行。<br>· 国外工具在国内访问可能不稳定，可自行选择可用工具。</p>';
+    $('proxyTutModal').hidden = false;
+  };
+  $('proxyTutClose').onclick = () => { $('proxyTutModal').hidden = true; };
+  $('proxyTutModal').addEventListener('click', e => { if (e.target === $('proxyTutModal')) $('proxyTutModal').hidden = true; });
   // 日志窗口：打开订阅（拉历史+实时），关闭退订；模式切换 / 清空
   $('btnLog').innerHTML = ICON_TERMINAL;
   $('btnLog').onclick = () => { if (logOpen) closeLog(); else openLog(); };
@@ -971,6 +1037,7 @@ async function init() {
   document.addEventListener('touchstart', resumeAllChannels, { passive: true });
   connectWS();
   setInterval(videoStats, 2000);
+  setInterval(updatePills, 1000); // 在线时长 + 共享状态徽章周期刷新
   setInterval(() => { if (ws && ws.readyState === WebSocket.OPEN) send({ type: 'ping', t: Date.now() }); }, 5000);
   setInterval(() => {
     // 本地心跳超时检测：15s 无 pong → 判定死连接 → 主动断开重连
@@ -1040,6 +1107,7 @@ async function refreshServerState() {
     myUsers = d.myUsers || [];
     netLinkRtt = d.linkRtts || {};
     if (d.ipv6) ipv6Info = d.ipv6; // 主机 IPv6 检测结果（关于弹窗展示）
+    checkProxyAccess(); // 穿透域名访问检测（每次页面加载询问一次；重连时 proxyAsked 已置位不再弹）
     if (d.serverStart) {
       const savedStart = localStorage.getItem('teashare_server_start');
       if (savedStart && d.serverStart > Number(savedStart)) serverRestarted = true;
@@ -1048,6 +1116,45 @@ async function refreshServerState() {
     }
     if (serverRestarted) $('verBanner').hidden = false;
   } catch (e) {}
+}
+
+// ---- 内网穿透检测（樱花/astral 等域名访问 → 提示切换直连；与具体穿透工具无关） ----
+function isDirectHost(hn) {
+  if (!hn) return true;
+  if (hn === 'localhost' || hn === '127.0.0.1' || hn === '::1') return true; // 本机自测
+  if (/^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hn)) return true; // 私有 IPv4 局域网直连
+  if (/^f[cd][0-9a-f]{2}:|^fe[89ab][0-9a-f]:/i.test(hn)) return true; // ULA / 链路本地 IPv6 直连
+  if (addrList.some(a => a.toLowerCase() === hn)) return true; // 服务器真实 IPv6
+  if (ipv6Info && ipv6Info.publicIPv4 && ipv6Info.publicIPv4 === hn) return true; // 公网 IPv4 直连
+  return false; // 其余视为穿透/代理域名
+}
+function directUrl() {
+  if (addrList.length) return `https://[${addrList[0]}]:${port}`;
+  if (ipv6Info && ipv6Info.publicIPv4) return `https://${ipv6Info.publicIPv4}:${port}`;
+  return '';
+}
+let proxyAsked = false; // 每次页面加载只询问一次（不记忆，刷新/重进仍会提示）
+function checkProxyAccess() {
+  const hn = location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (proxyAsked || isDirectHost(hn)) return;
+  proxyAsked = true;
+  const url = directUrl();
+  // 顶部横幅（常驻，可关闭；不持久化）
+  $('proxyBanner').hidden = false;
+  $('proxyBannerSwitch').onclick = () => { if (url) location.href = url; };
+  $('proxyBannerClose').onclick = () => { $('proxyBanner').hidden = true; };
+  // 进来即弹窗询问
+  if (!url) {
+    $('proxyDirectUrl').textContent = '当前主机未检测到可直连的地址，请继续使用穿透方式。';
+    $('proxySwitch').hidden = true;
+  } else {
+    $('proxyDirectUrl').textContent = url;
+    $('proxySwitch').onclick = () => location.href = url;
+  }
+  $('proxySkip').onclick = () => { $('proxyModal').hidden = true; };
+  $('proxyClose').onclick = () => { $('proxyModal').hidden = true; };
+  $('proxyModal').addEventListener('click', e => { if (e.target === $('proxyModal')) $('proxyModal').hidden = true; });
+  $('proxyModal').hidden = false;
 }
 
 // 互联节点地址缓存（localStorage）：断线后引导切换到其他主机
@@ -1117,7 +1224,7 @@ function onMessage(m) {
       break;
     case 'peer-joined':
       if (m.id === myId) break; // 忽略自己
-      peers.set(m.id, { id: m.id, name: m.name, color: m.color, sharing: false, host: m.host, ip: m.ip, enterHost: m.enterHost || '', hostId: m.hostId || '' });
+      peers.set(m.id, { id: m.id, name: m.name, color: m.color, sharing: false, host: m.host, ip: m.ip, enterHost: m.enterHost || '', hostId: m.hostId || '', joinedAt: m.joinedAt || 0 });
       sndUserJoin();
       renderGrid();
       break;
@@ -1158,9 +1265,9 @@ function onMessage(m) {
       streamStart.delete(m.id);
       manualTier.delete(m.id);
       _streamRate.delete(m.id);
-      for (const [tid, sid] of trackOf) { if (sid === m.id) trackOf.delete(tid); }
-      for (const [mid, sid] of midOf) { if (sid === m.id) midOf.delete(mid); }
-      for (const [ssrc, sid] of ssrcOf) { if (sid === m.id) ssrcOf.delete(ssrc); }
+      for (const [tid, sid] of trackOf) { if (sid === m.id || (m.ownerId && (sid === m.ownerId || sid.startsWith(m.ownerId + '-')))) trackOf.delete(tid); }
+      for (const [mid, sid] of midOf) { if (sid === m.id || (m.ownerId && (sid === m.ownerId || sid.startsWith(m.ownerId + '-')))) midOf.delete(mid); }
+      for (const [ssrc, sid] of ssrcOf) { if (sid === m.id || (m.ownerId && (sid === m.ownerId || sid.startsWith(m.ownerId + '-')))) ssrcOf.delete(ssrc); }
       if (m.ownerId) { // 清理该用户全部音频通道缓存（流 id 为 ownerId 或 ownerId-a）
         for (const k of audioCache.keys()) { if (k.startsWith(m.ownerId + '-')) audioCache.delete(k); }
       }
@@ -1168,8 +1275,15 @@ function onMessage(m) {
       renderGrid();
       break;
     case 'stream-audio-removed':
-      // 视频流仍在，仅音频通道移除（观看端对应卡片的音频停止）
-      if (m.ownerId && m.kind) audioCache.delete(m.ownerId + '-' + m.kind);
+      // 视频流仍在，仅音频通道移除（观看端对应卡片的音频停止）——清理残留轨映射，徽章状态随之刷新
+      if (m.ownerId && m.kind) {
+        const asid = m.ownerId + '-a-' + m.kind;
+        audioCache.delete(m.ownerId + '-' + m.kind);
+        streamStart.delete(asid);
+        for (const [tid, sid] of trackOf) { if (sid === asid) trackOf.delete(tid); }
+        for (const [mid, sid] of midOf) { if (sid === asid) midOf.delete(mid); }
+        for (const [ssrc, sid] of ssrcOf) { if (sid === asid) ssrcOf.delete(ssrc); }
+      }
       renderGrid();
       break;
     case 'publish-answer':
@@ -1306,6 +1420,11 @@ async function handleSubscribeOffer(m) {
 
 /* ---------- 我的卡片 ---------- */
 
+// 全局节点编号 S1、S2…（所有节点含本节点按 nodeId 排序，序号跨节点一致；与卡片徽章/拓扑一致）
+function nodeSeqOf(id) {
+  return [nodeId, ...netNodes.map(n => n.id)].sort().indexOf(id) + 1;
+}
+
 function renderMyCard() {
   const old = document.getElementById('myCard');
   if (old) old.remove(); // 重建前移除旧卡片（避免重复 myCard 导致用户名/状态不更新）
@@ -1315,7 +1434,8 @@ function renderMyCard() {
   el.innerHTML = `
     <div class="phead"><span class="dot" style="background:${myColor}"></span>
       <span class="pname">我${myName ? '（' + myName + '）' : ''}</span>
-      <span class="pill" id="myPill">屏幕未共享</span>
+      <span class="pill" id="myPill" data-pill="me" data-joined="${pageStartTs}"><span data-pill-dur>在线: --</span><span data-pill-state> • ${pillStateTxt('me')}</span></span>
+      ${myIsHost ? `<span class="pill host">服务器主机 S${nodeSeqOf(nodeId) || '?'}</span>` : ''}
     </div>
     <span class="rttBadge" id="rtt-me">—</span>
     <video id="myVideo" autoplay playsinline muted hidden></video>
@@ -1685,6 +1805,7 @@ async function toggleAudioShare(kind) {
     return;
   }
   audioTracks[kind] = rawStream.getAudioTracks()[0];
+  myAudioStart[kind] = Date.now();
   audioTracks[kind].onended = () => stopAudioShare(kind); // 浏览器原生停止共享（标签页音频）时自动复位
   // Web Audio 处理链：无损默认（仅降噪+增益）；标准档接入智能均衡+软膝
   const chain = buildAudioChain(kind, rawStream, audioSettings[kind].quality === 'voice' ? 32000 : undefined);
@@ -1722,6 +1843,7 @@ async function toggleAudioShare(kind) {
 function stopAudioShare(kind) {
   if (audioPubPCs[kind]) { audioPubPCs[kind].close(); delete audioPubPCs[kind]; }
   if (audioTracks[kind]) { audioTracks[kind].onended = null; audioTracks[kind].stop(); delete audioTracks[kind]; }
+  myAudioStart[kind] = 0;
   if (audioChains[kind]) {
     cancelAnimationFrame(audioChains[kind].raf);
     audioChains[kind].ctx.close().catch(() => {});
@@ -2089,6 +2211,7 @@ async function restartCamPublish() {
 
 function setupPublish(stream) {
   myStream = stream;
+  myStreamStart = Date.now();
   myTrack = stream.getVideoTracks()[0];
   myTrack.onended = () => {
     stopShare();
@@ -2097,8 +2220,7 @@ function setupPublish(stream) {
   };
   $('myVideo').srcObject = stream;
   $('myVideo').hidden = false;
-  $('myPill').textContent = '屏幕共享中';
-  $('myPill').className = 'pill on';
+  $('myPill').classList.add('on'); // 状态文字由 updatePills 周期刷新
   $('btnStart').innerHTML = ICON_STOP; // 共享中：停止图标
   $('btnStart').classList.remove('idle');
   $('btnStart').classList.add('active'); // 共享中：白色
@@ -2119,6 +2241,7 @@ async function restartCapture() {
   let stream;
   try { stream = await getCaptureStream(); } catch (e) { return; }
   myStream = stream;
+  myStreamStart = Date.now();
   myTrack = stream.getVideoTracks()[0];
   myTrack.onended = () => stopShare();
   $('myVideo').srcObject = stream;
@@ -2138,10 +2261,10 @@ function closePublish() {
     myStream.getTracks().forEach(t => { t.onended = null; t.stop(); });
   }
   myStream = null; myTrack = null;
+  myStreamStart = 0;
   $('myVideo').srcObject = null;
   $('myVideo').hidden = true;
-  $('myPill').textContent = '屏幕未共享';
-  $('myPill').className = 'pill';
+  $('myPill').classList.remove('on'); // 状态文字由 updatePills 周期刷新
   $('btnStart').innerHTML = ICON_MONITOR; // 未共享：显示器图标
   $('btnStart').classList.remove('active');
   $('btnStart').classList.add('idle'); // 未共享：灰色
@@ -2207,6 +2330,7 @@ async function toggleCameraShare() {
     stream = await navigator.mediaDevices.getUserMedia({ video: videoOpts });
   } catch (e) { state.textContent = '摄像头获取失败'; return; }
   camStream = stream;
+  myCamStart = Date.now();
   camTrack = stream.getVideoTracks()[0];
   camTrack.onended = () => {
     stopCameraShare();
@@ -2229,6 +2353,7 @@ function stopCameraShare() {
   if (camPC) { camPC.close(); camPC = null; }
   if (camStream) { camStream.getTracks().forEach(t => { t.onended = null; t.stop(); }); }
   camStream = null; camTrack = null;
+  myCamStart = 0;
   $('myCamVideo').srcObject = null;
   $('myCamVideo').hidden = true;
   const btn = $('btnCam');
@@ -2911,8 +3036,7 @@ function rebuildGrid() {
     const camSharing = !!camStreamId;
     const hasVideo = sharing && !!vCached;
     const hasAudioStream = !!audioStreamId;
-    const pill = sharing ? '<span class="pill on">共享中</span>'
-      : (hasAudioStream ? '<span class="pill on">音频中</span>' : '<span class="pill">在线</span>');
+    const pill = `<span class="pill ${(sharing || camSharing || hasAudioStream) ? 'on' : ''}" data-pill="${id}" data-joined="${info.joinedAt || 0}"><span data-pill-dur>在线: --</span><span data-pill-state> • ${pillStateTxt(id)}</span></span>`;
     // 服务运行者徽章带全局节点编号：本地 host 属本节点（nodeId）；远端 host 属其 id 前缀节点
     const hostNode = info.id.includes(':') ? info.id.split(':')[0] : nodeId;
     const hostPill = info.host ? `<span class="pill host">服务器主机 S${nodeSeq[hostNode] || '?'}</span>` : '';
@@ -3172,26 +3296,33 @@ function videoStats() {
   const mine = document.getElementById('myCard');
   if (!mine) return;
   const st = mine.querySelector('#myStats');
-  if (!subPC) {
-    st.textContent = myStream
-      ? (myWatchers > 0 ? `共享中，${myWatchers} 人正在观看` : '共享中，等待他人加入…')
-      : (Object.keys(audioTracks).length > 0 ? '音频共享中…' : '等待他人共享…');
+  // 统计：中继 subPC（视频/音频轨经 trackOf 关联流 id）+ 所有发送端 PC（屏幕/摄像头/麦克风/系统音频）
+  const sendPcs = [pubPC, camPC, audioPubPCs.mic, audioPubPCs.system].filter(Boolean);
+  if (!subPC && !sendPcs.length) {
+    // 无接收无发送：保留累计统计行（累计值持久保留，速率归零），首行显示状态提示
+    st.innerHTML =
+      (myStream
+        ? (myWatchers > 0 ? `共享中，${myWatchers} 人正在观看` : '共享中，等待他人加入…')
+        : (Object.keys(audioTracks).length > 0 ? '音频共享中…' : '等待他人共享…')) +
+      `<br>发 ${fmtRate(0)} | 累计发送 ${(_sentAccum / 1048576).toFixed(2)} MB | ` +
+      `收 ${fmtRate(0)} | 累计接收 ${(_recvAccum / 1048576).toFixed(2)} MB | 丢包 -`;
     return;
   }
-  // 统计：中继 subPC（视频/音频轨经 trackOf 关联流 id）
-  Promise.all([subPC.getStats()]).then(results => {
+  const statPcs = subPC ? [subPC, ...sendPcs] : sendPcs; // 仅发送（无接收）时也触发统计显示
+  Promise.all(statPcs.map(p => p.getStats())).then(results => {
     const allStats = [];
     results.forEach(rs => rs.forEach(s => allStats.push(s)));
-    let recv = 0, lost = 0, pkts = 0;
+    let recv = 0, lost = 0, pkts = 0, sent = 0;
     const perStream = new Map(); // streamId -> 指标
     let pair = null, dtls = '', iceRole = '', selectedPairId = '';
     allStats.forEach(s => {
+      if (s.type === 'outbound-rtp' && (s.kind === 'video' || s.kind === 'audio')) {
+        sent += s.bytesSent || 0; // 累计发送（自己发出的视频+声音）
+      }
       if (s.type === 'inbound-rtp' && (s.kind === 'video' || s.kind === 'audio')) {
-        if (s.kind === 'video') {
-          recv += s.bytesReceived || 0;
-          lost += s.packetsLost || 0;
-          pkts += s.packetsReceived || 0;
-        }
+        recv += s.bytesReceived || 0; // 累计接收（他人视频+声音，修复此前不含 audio）
+        lost += s.packetsLost || 0;
+        pkts += s.packetsReceived || 0;
         const sid = trackOf.get(s.trackId) || midOf.get(s.mid) || ssrcOf.get(s.ssrc);
         if (sid) {
           const m = perStream.get(sid) || { kind: s.kind, bytes: 0, lost: 0, pkts: 0, fps: 0, decoded: 0, dropped: 0, keyFrames: 0, jitter: 0, codec: '', codecId: '', clockRate: 0, channels: 0 };
@@ -3363,7 +3494,13 @@ function videoStats() {
     const loss = pkts + lost > 0 ? (100 * lost / (pkts + lost)).toFixed(1) : '-';
     const wsTxt = wsRtt != null ? `信号 ${wsRtt}ms` : '';
     const wTxt = myStream ? (myWatchers > 0 ? `共享中，${myWatchers} 人观看 | ` : '') : '';
-    st.textContent = `${wTxt}${vs} ${wsTxt} | 收 ${fmtRate(prevRate(recv))} | 丢包 ${loss}%`;
+    // 累计发送/接收持久累加（停止共享后保留，重新共享继续累加；PC 重建归零时跳过负增量）
+    const ds = sent - _sentLast; if (ds > 0) _sentAccum += ds; _sentLast = sent;
+    const dr = recv - _recvLast; if (dr > 0) _recvAccum += dr; _recvLast = recv;
+    st.innerHTML =
+      `${wTxt}${vs} ${wsTxt}<br>` +
+      `发 ${fmtRate(prevSentRate(sent))} | 累计发送 ${(_sentAccum / 1048576).toFixed(2)} MB | ` +
+      `收 ${fmtRate(prevRate(recv))} | 累计接收 ${(_recvAccum / 1048576).toFixed(2)} MB | 丢包 ${loss}%`;
     // 弹窗兜底刷新：独立于 perStream 循环，确保打开中的详情实时更新
     if (detailModalTarget) {
       const dl = document.getElementById('detail-' + detailModalTarget);
@@ -3372,6 +3509,7 @@ function videoStats() {
   }).catch(err => console.error('[stats] 获取失败:', err));
 }
 let _prevRecv = null, _prevRecvAt = null;
+let _sentAccum = 0, _recvAccum = 0, _sentLast = 0, _recvLast = 0; // 累计发送/接收字节（跨共享会话保留）
 function prevRate(cur) {
   const now = Date.now();
   let bps = 0;
@@ -3381,6 +3519,16 @@ function prevRate(cur) {
   _prevRecv = cur; _prevRecvAt = now;
   return bps;
 }
+let _prevSent = null, _prevSentAt = null;
+function prevSentRate(cur) {
+  const now = Date.now();
+  let bps = 0;
+  if (_prevSent != null && _prevSentAt != null && now > _prevSentAt && cur >= _prevSent) {
+    bps = (cur - _prevSent) * 1000 / (now - _prevSentAt);
+  }
+  _prevSent = cur; _prevSentAt = now;
+  return bps;
+}
 const _streamRate = new Map(); // streamId -> {bytes, at}
 function fmtDur(startTs) {
   if (!startTs) return '-';
@@ -3388,6 +3536,49 @@ function fmtDur(startTs) {
   const mm = String(Math.floor(s / 60)).padStart(2, '0');
   const ss = String(s % 60).padStart(2, '0');
   return `${mm}:${ss}`;
+}
+// 在线时长 HH:MM:SS（小时累计，超 24h 显示 25:01:05）
+function fmtDurHMS(startTs) {
+  if (!startTs) return '--:--:--';
+  const s = Math.max(0, Math.floor((Date.now() - startTs) / 1000));
+  const h = Math.floor(s / 3600);
+  const mm = String(Math.floor((s % 3600) / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${h}:${mm}:${ss}`;
+}
+// 状态徽章文本：各状态带各自持续时长（未共享/屏幕/摄像头/麦克风/音频，多状态 • 分隔）
+function pillStateTxt(pid) {
+  const parts = [];
+  const push = (label, start) => { if (start > 0) parts.push(`${label}: ${fmtDurHMS(start)}`); };
+  if (pid === 'me') {
+    if (myStream) push('屏幕', myStreamStart);
+    if (camStream) push('摄像头', myCamStart);
+    if (audioTracks.mic) push('麦克风', myAudioStart.mic);
+    if (audioTracks.system) push('音频', myAudioStart.system);
+  } else {
+    if (streamOwners.has(pid)) push('屏幕', streamStart.get(pid));
+    if (streamOwners.has(pid + '-cam')) push('摄像头', streamStart.get(pid + '-cam'));
+    for (const sid of trackOf.values()) {
+      const pfx = pid + '-a-';
+      if (sid.startsWith(pfx)) {
+        const kind = sid.slice(pfx.length);
+        push(kind === 'mic' ? '麦克风' : '音频', streamStart.get(sid));
+      }
+    }
+  }
+  return parts.length ? parts.join(' • ') : '未共享';
+}
+// 统一状态徽章周期刷新：在线时长 + 各共享状态时长
+function updatePills() {
+  document.querySelectorAll('[data-pill]').forEach(pl => {
+    const dur = pl.querySelector('[data-pill-dur]');
+    if (dur) dur.textContent = '在线: ' + fmtDurHMS(Number(pl.dataset.joined) || 0);
+    const st = pl.querySelector('[data-pill-state]');
+    if (!st) return;
+    const t = pillStateTxt(pl.dataset.pill);
+    st.textContent = t === '未共享' ? ' • 未共享' : ' • ' + t;
+    pl.classList.toggle('on', t !== '未共享');
+  });
 }
 function streamRate(sid, bytes) {
   const now = Date.now();
@@ -3438,16 +3629,23 @@ function renderAddrs() {
   };
 }
 
-// 分享地址列表：本机（S1）+ 各互联主机（全局编号与卡片/拓扑一致），单个或全部复制
+// 分享地址列表：本机（S1，IPv6 + 公网 IPv4）+ 各互联主机（全局编号与卡片/拓扑一致），单个或全部复制
 function buildShareUrls() {
   const list = [];
   const seenUrls = new Set();
   const seq = {};
   [nodeId, ...netNodes.map(n => n.id)].sort().forEach((nid, i) => { seq[nid] = i + 1; });
+  const selfSeq = seq[nodeId] || 1;
   addrList.forEach(a => {
     const url = `https://[${a}]:${port}`;
-    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + (seq[nodeId] || 1) + '（本机）', url }); }
+    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + selfSeq + '（本机）', url }); }
   });
+  // 公网 IPv4 可达时也提供（无 IPv6 场景的兜底入口，避免复制出 localhost 无效地址）
+  const v4 = (ipv6Info && ipv6Info.publicIPv4) || '';
+  if (v4 && !addrList.length) {
+    const url = `https://${v4}:${port}`;
+    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + selfSeq + '（本机 IPv4）', url }); }
+  }
   netNodes.forEach(n => {
     const url = 'https://' + (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
     if (url && !seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + (seq[n.id] || '?'), url }); }
@@ -3455,13 +3653,49 @@ function buildShareUrls() {
   return list;
 }
 
+// IPv6 场景提示（关于/分享弹窗共用）：主机无 IPv6 → 建议主机开启；主机有 IPv6 → 提示浏览端开启（可复制提示发给对方）
+const IPV6_TEST_LINKS = [
+  'https://testipv6.cn/',
+  'https://bj-ipv6.com/z/'
+];
+function renderIpv6Hint(hintEl, copyRow, copyBtn, visitUrl) {
+  const v6 = ipv6Info || {};
+  const v6Has = v6.localAddrs && v6.localAddrs.length;
+  const ipv6Cmd = 'netsh interface ipv6 enable';
+  const testTxt = '检测 IPv6 是否可用：\r\n' + IPV6_TEST_LINKS.join('\r\n');
+  const url = visitUrl || location.origin;
+  if (v6Has) {
+    hintEl.innerHTML = '<span class="hint">浏览端也需开启 IPv6 才能通过 IPv6 地址访问（IPv6 检测：testipv6.cn / bj-ipv6.com）</span>';
+    const text = '请开启 IPv6 后访问：' + url +
+      '\r\n开启命令（管理员运行）：' + ipv6Cmd +
+      '\r\n' + testTxt;
+    copyRow.hidden = false;
+    copyBtn.textContent = '复制提示给浏览端';
+    copyBtn.onclick = () => {
+      const done = () => { copyBtn.textContent = '已复制'; setTimeout(() => copyBtn.textContent = '复制提示给浏览端', 1500); };
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done));
+      else fallbackCopy(text, done);
+    };
+  } else {
+    hintEl.innerHTML = '<span class="warn">主机未检测到 IPv6，对方将无法通过 IPv6 访问，请检查/开启本机 IPv6（IPv6 检测：testipv6.cn / bj-ipv6.com）</span>';
+    copyRow.hidden = false;
+    copyBtn.textContent = '复制开启 IPv6 命令';
+    copyBtn.onclick = () => {
+      const done = () => { copyBtn.textContent = '已复制'; setTimeout(() => copyBtn.textContent = '复制开启 IPv6 命令', 1500); };
+      const txt = ipv6Cmd + '\r\n' + testTxt;
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done).catch(() => fallbackCopy(txt, done));
+      else fallbackCopy(txt, done);
+    };
+  }
+}
+
 function renderShareList() {
   const list = buildShareUrls();
-  if (!list.length) list.push({ label: 'S1（本机）', url: location.origin }); // 兜底：无地址列表时复制当前页面
   const el = $('shareList');
   el.innerHTML = list.map(x => `
     <div class="netItem"><span class="netDot" style="background:#2a9d8f"></span><b>${escapeHtml(x.label)}</b>
-      <code>${escapeHtml(x.url)}</code><button class="btn mini" data-copy="${escapeHtml(x.url)}">复制</button></div>`).join('')
+      <code>${escapeHtml(x.url)}</code><button class="btn mini" data-copy="${escapeHtml(x.url)}">复制</button>
+      <button class="btn mini" data-join="${escapeHtml(x.url)}" title="在新标签页打开该主机">加入</button></div>`).join('')
     || '<div style="font-size:12px;color:#8fa3c4">暂无可用地址</div>';
   el.querySelectorAll('[data-copy]').forEach(b => {
     b.onclick = () => {
@@ -3471,12 +3705,20 @@ function renderShareList() {
       else fallbackCopy(u, done);
     };
   });
+  el.querySelectorAll('[data-join]').forEach(b => {
+    b.onclick = () => {
+      const u = b.dataset.join;
+      openCtrlApply('加入主机', `是否在新标签页加入该主机？\n${u}`, '加入', () => window.open(u, '_blank'));
+    };
+  });
   $('shareCopyAll').onclick = () => {
     const txt = [...new Set(list.map(x => x.url))].join('\n');
     const done = () => { $('shareCopyAll').textContent = '已复制'; setTimeout(() => $('shareCopyAll').textContent = '复制全部', 1500); };
     if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt).then(done).catch(() => fallbackCopy(txt, done));
     else fallbackCopy(txt, done);
   };
+  // IPv6 场景提示（与「关于」弹窗同一内容；复制提示里的访问地址取列表首个真实地址）
+  renderIpv6Hint($('shareIpv6Hint'), $('shareIpv6CopyRow'), $('shareIpv6CopyBtn'), list.length ? list[0].url : location.origin);
 }
 
 // 多主机自动互联：页面地址自带对方 IPv6（location.origin），本机若运行服务则自动连入该节点
@@ -3660,6 +3902,11 @@ function renderAbout() {
     ? `<span class="ok">可达</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
     : '<span class="warn">不可达</span>';
   $('aboutIpv6Public4').textContent = v6.publicIPv4 || '不可达';
+  // IPv6 场景提示（与「分享观看地址」弹窗同一内容；访问地址取首个真实 IPv6，无则公网 IPv4）
+  let aboutVisit = location.origin;
+  if (addrList.length) aboutVisit = `https://[${addrList[0]}]:${port}`;
+  else if (v6.publicIPv4) aboutVisit = `https://${v6.publicIPv4}:${port}`;
+  renderIpv6Hint($('aboutIpv6Hint'), $('aboutIpv6CopyRow'), $('aboutIpv6CopyBtn'), aboutVisit);
   // 服务器重启状态（refreshServerState 检测；断开重连期间也能感知）
   $('aboutRefresh').hidden = !serverRestarted;
   if (!aboutTimer) aboutTimer = setInterval(renderAbout, 1000);
@@ -3879,15 +4126,54 @@ function renderNetTopo() {
       renderNetTopo();
     };
   });
-  // 操作栏：总览 + 选中远端主机 → 切换
+  // 操作栏：总览 + 选中主机（含本机）→ 打开/切换
   const totalUsers = myUsers.length + netNodes.reduce((s, n) => s + (n.users ? n.users.length : 0), 0);
-  if (netSel && netSel !== selfId) {
+  if (netSel) {
     const addr = addrOf[netSel] || '';
-    act.innerHTML = `已选主机 <b>${escapeHtml(netSel)}</b>（${escapeHtml(addr)}）<button class="btn primary" id="btnSwitchNode">切换到该主机</button>`;
+    const isSelf = netSel === selfId;
+    act.innerHTML = `已选主机 <b>${escapeHtml(netSel)}</b>（${escapeHtml(addr)}）<button class="btn primary" id="btnSwitchNode">${isSelf ? '打开本机页面' : '切换到该主机'}</button>`;
     const btn = $('btnSwitchNode');
-    if (btn) btn.onclick = () => window.open('https://' + addr, '_blank');
+    if (btn) btn.onclick = () => {
+      const target = addr.startsWith('http') ? addr : 'https://' + addr;
+      openCtrlApply(isSelf ? '打开本机页面' : '切换到该主机',
+        `是否在新标签页打开该主机？\n${addr}`,
+        isSelf ? '打开' : '切换', () => window.open(target, '_blank'));
+    };
   } else {
-    act.innerHTML = `<span style="font-size:12px;color:#8fa3c4">${netNodes.length} 台互联主机 · 在线用户 ${totalUsers} 人${netNodes.length ? '，点击主机可切换' : ''}</span>`;
+    let ops = `<span style="font-size:12px;color:#8fa3c4">${netNodes.length} 台互联主机 · 在线用户 ${totalUsers} 人${netNodes.length ? '，点击主机可切换' : ''}</span>`;
+    // 退出互联（仅本机管理者）：本机页面直调本服务；非本机页面经 localhost 探测本机服务
+    const hn = location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    const isLocalPage = hn === 'localhost' || hn === '127.0.0.1' || hn === '::1';
+    if (isLocalPage && myIsHost && netNodes.length) {
+      ops += ' <button class="btn mini" id="btnExitNet">退出互联</button>';
+    } else if (!isLocalPage) {
+      fetch('https://localhost:7553/api/node-state', { cache: 'no-store' })
+        .then(r => r.json()).then(s => {
+          if (s && s.connected > 0 && !document.getElementById('btnExitNet')) {
+            const b = document.createElement('button');
+            b.className = 'btn mini';
+            b.id = 'btnExitNet';
+            b.textContent = '退出互联并切换为本机页面';
+            b.onclick = async () => {
+              try {
+                const r2 = await fetch('https://localhost:7553/api/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+                if (r2.ok) location.href = 'https://localhost:7553'; // 当前标签页跳转本机页面
+                else flashMsg('断开本机互联失败');
+              } catch (e) { flashMsg('无法连接本机服务'); }
+            };
+            act.appendChild(b);
+          }
+        }).catch(() => {});
+    }
+    act.innerHTML = ops;
+    const bn = $('btnExitNet');
+    if (bn && isLocalPage) bn.onclick = async () => {
+      try {
+        const r = await fetch('/api/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
+        if (r.ok) renderNetTopo();
+        else flashMsg('退出互联失败');
+      } catch (e) { flashMsg('退出互联失败'); }
+    };
   }
 }
 </script>

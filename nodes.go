@@ -75,6 +75,58 @@ func randomToken(n int) string {
 
 // ---------- HTTP 入口 ----------
 
+// GET /api/node-state：仅本机可调。返回本机当前互联数量（供远端页面探测本机互联状态）
+func (h *hub) handleNodeState(w http.ResponseWriter, r *http.Request) {
+	corsOrigin := r.Header.Get("Origin")
+	if corsOrigin == "" {
+		corsOrigin = "*"
+	}
+	w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
+	w.Header().Set("Access-Control-Allow-Private-Network", "true")
+	if !isHostConn(r) {
+		http.Error(w, "仅本机可查询", http.StatusForbidden)
+		return
+	}
+	h.mu.Lock()
+	n := len(h.nodes)
+	h.mu.Unlock()
+	json.NewEncoder(w).Encode(map[string]any{"connected": n})
+}
+
+// POST /api/disconnect：仅本机可调。断开本节点全部互联（远端页面 / 本机页面共用），返回断开数量
+func (h *hub) handleDisconnect(w http.ResponseWriter, r *http.Request) {
+	corsOrigin := r.Header.Get("Origin")
+	if corsOrigin == "" {
+		corsOrigin = "*"
+	}
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Private-Network", "true")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", corsOrigin)
+	if !isHostConn(r) {
+		http.Error(w, "仅本机可断开", http.StatusForbidden)
+		return
+	}
+	h.mu.Lock()
+	links := make([]*nodeLink, 0, len(h.nodes))
+	for _, nl := range h.nodes {
+		links = append(links, nl)
+	}
+	h.mu.Unlock()
+	for _, nl := range links {
+		nl.close()
+	}
+	h.mu.Lock()
+	n := len(h.nodes)
+	h.mu.Unlock()
+	json.NewEncoder(w).Encode(map[string]any{"disconnected": n})
+}
+
 // POST /api/join {remote}：仅本机可调。向远端请求 join token 后建立节点连接
 // POST /api/join {remote}：仅本机可调。自动互联：页面（https://[对方IPv6]:port）加载后
 // 直接 POST 本机该接口 {remote: 页面地址}，本机即自动连接对方节点
@@ -757,7 +809,7 @@ func (nl *nodeLink) remotePeerAdd(info map[string]any) {
 	h.mu.Lock()
 	p := h.peers[rid]
 	if p == nil {
-		p = &peer{hub: h, id: rid, conn: nil, send: make(chan []byte, 1)}
+		p = &peer{hub: h, id: rid, conn: nil, send: make(chan []byte, 1), joinedAt: time.Now().UnixMilli()}
 		h.peers[rid] = p
 		nl.peerIDs[rid] = true
 	}
@@ -767,11 +819,14 @@ func (nl *nodeLink) remotePeerAdd(info map[string]any) {
 	p.host, _ = info["host"].(bool)
 	p.ip, _ = info["ip"].(string)
 	p.enterHost, _ = info["enterHost"].(string)
+	if jt, ok := info["joinedAt"].(float64); ok && jt > 0 {
+		p.joinedAt = int64(jt) // 远端真实加入时刻
+	}
 	if hid, _ := info["hostId"].(string); hid != "" {
 		p.hostId = nl.id + ":" + hid
 	}
 	h.mu.Unlock()
-	h.broadcast(map[string]any{"type": "peer-joined", "id": rid, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId})
+	h.broadcast(map[string]any{"type": "peer-joined", "id": rid, "name": p.name, "color": p.color, "host": p.host, "ip": p.ip, "enterHost": p.enterHost, "hostId": p.hostId, "joinedAt": p.joinedAt})
 	h.broadcastTopo() // 拓扑子用户变化
 	log.Printf("node: 远端用户同步 %s(%s)", rid, p.name)
 }
