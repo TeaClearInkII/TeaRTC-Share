@@ -337,20 +337,6 @@
   .netItem code { color: #8fa3c4; font-size: 12px; flex: 1; word-break: break-all; }
   .netItem .btn { flex-shrink: 0; }
   .netDot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  #netTopoWrap { background: rgba(255,255,255,0.04); border-radius: 8px; max-height: 60vh; overflow: hidden; cursor: grab; touch-action: none; }
-  #netTopoWrap.dragging { cursor: grabbing; }
-  #netTopo { width: 100%; height: auto; display: block; }
-  #netTopo .topoLink { stroke: rgba(251,191,36,0.4); stroke-width: 2.5; }
-  #netTopo .topoNode { cursor: pointer; }
-  #netTopo .topoNode text { font-size: 12px; fill: #fde68a; text-anchor: middle; pointer-events: none; font-weight: 600; }
-  #netTopo .topoNode .addr { font-size: 9px; fill: #8fa3c4; font-weight: 400; }
-  #netTopo .topoNode.sel circle:first-of-type { stroke: #fff; stroke-width: 3; }
-  #netTopo .userLink { stroke: rgba(203,213,225,0.35); stroke-width: 1; }
-  #netTopo .topoUser { cursor: default; }
-  #netTopo .topoUser circle { fill: #cbd5e1; stroke: none; }
-  #netTopo .topoUser.self circle { fill: #fbbf24; }
-  #netTopo .topoUser.self .glow { fill: none; stroke: rgba(251,191,36,0.5); stroke-width: 3; }
-  #netAction { min-height: 30px; display: flex; align-items: center; gap: 10px; font-size: 13px; flex-wrap: wrap; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -359,7 +345,6 @@
   <span class="badge" id="netState">连接中…</span>
   <span class="badge" id="meBadge"></span>
   <button class="btn mini iconbtn" id="btnNameCfg" title="设置昵称"></button>
-  <button class="btn mini iconbtn" id="btnNet" title="多主机互联"></button>
   <button class="btn mini iconbtn" id="btnShareAddr" title="分享观看地址"></button>
   <button class="btn mini iconbtn" id="btnFirewall" title="防火墙与 CA 证书"></button>
   <span style="position:relative">
@@ -552,21 +537,6 @@
   </div>
 </div>
 
-<div id="netModal" class="modal" hidden>
-  <div class="modalBox" style="min-width:min(580px,92vw)">
-    <div class="modalHead"><span>多主机互联拓扑</span><button class="btn mini" id="netClose">×</button></div>
-    <div class="row" style="margin:10px 0">
-      <input type="text" id="netInput" placeholder="手动互联：目标主机地址，如 [2409:...]:7553" style="flex:1">
-      <button class="btn primary" id="btnNetJoin">连接</button>
-    </div>
-    <div id="netTopoWrap">
-      <svg id="netTopo" viewBox="0 0 560 340"></svg>
-    </div>
-    <div id="netHint" style="font-size:12px;color:#8fa3c4;margin:8px 0">打开其他主机的页面即自动互联；点击远端节点可切换主机</div>
-    <div id="netAction"></div>
-  </div>
-</div>
-
 <div id="detailModal" class="modal" hidden>
   <div class="modalBox">
     <div class="modalHead"><span id="detailModalTitle"></span><button class="btn mini" id="detailModalClose">×</button></div>
@@ -708,10 +678,7 @@ function fmtRate(bps) {
 }
 
 let ws = null, myId = '', myName = '', myColor = '#9fb3d1', myClientId = '', myIsHost = false;
-let nodeId = '', netNodes = [], netTopo = {}, netSel = null, myUsers = [], myRtt = 0, myHostName = '', myIp = ''; // 本节点 id / 互联节点 / 全局拓扑 / 选中节点 / 本节点子用户 / 自己的延迟 / 本节点服务运行者昵称 / 自己的源 IP
-let netLinkRtt = {}; // 节点间延迟矩阵 {nodeId: {neighborId: ms}}
-let hostRtts = {};   // 自己的点到各互联主机的真实延迟 {nodeId: ms}
-let topoTimer = null; // 拓扑弹窗刷新定时器
+let myHostName = '', myIp = ''; // 服务运行者昵称 / 自己的源 IP
 let wsRetry = 0;      // 连续断线重连计数（≥5 提示主机断线）
 let lastPongT = 0;    // 最近一次收到 pong 的时间（本地心跳超时检测）
 let pasteQueue = [];  // 聊天粘贴候选 [{file, url}]（面板关闭保留，发送后清空）
@@ -723,8 +690,6 @@ let ipv6Info = null; // 主机 IPv6 检测结果（/addrs 下发；关于弹窗�
 const uaStr = navigator.userAgent;
 const isIOS = /iPhone|iPad|iPod/i.test(uaStr) || (navigator.maxTouchPoints > 0 && /Macintosh/i.test(uaStr) && /Safari/i.test(uaStr) && !/Chrome|Edg/i.test(uaStr));
 const isMobileDevice = isIOS || /Android/i.test(uaStr);
-let topoVB = null; // 拓扑图当前视图（viewBox），节点/尺寸变化时重置
-let panState = { on: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 }; // 拖动平移状态
 let pubPC = null, subPC = null;
 let myStream = null, myTrack = null;
 let myStreamStart = 0, myCamStart = 0; const myAudioStart = { mic: 0, system: 0 }; // 自己各共享会话开始时间（徽章时长）
@@ -744,56 +709,23 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.2.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.3.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
 
 async function init() {
   if (isMobileDevice) flashMsg('检测到手机浏览器：摄像头共享已自动使用 VP8 兼容编码'); // 手机环境提示（iOS H.264 缺陷自动回退）
-  await refreshServerState(); // 首次加载：拉取服务器状态（含 serverStart/节点/拓扑）
-  // 断线缓存过期清理（>7 天丢弃，防陈旧地址误导断线引导）
-  try {
-    const nc = JSON.parse(localStorage.getItem('teashare_nodes') || 'null');
-    if (nc && Date.now() - nc.at > 7 * 86400000) localStorage.removeItem('teashare_nodes');
-  } catch (e) {}
+  await refreshServerState(); // 首次加载：拉取服务器状态
   renderAddrs();
-  saveNodeCache(); // 缓存互联节点地址（断线引导切换用）
-  autoJoinLocal(); // 多主机自动互联：页面自带对方 IPv6（location.origin），本机有服务则自动连入
   const saved = localStorage.getItem('teashare_name');
   if (saved) { $('nameInput').value = saved; myName = saved; } // 回填变量，刷新后 hello 携带昵称
   let cid = localStorage.getItem('teashare_cid');
   if (!cid) { cid = 'c' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); localStorage.setItem('teashare_cid', cid); }
   myClientId = cid;
   $('btnNameCfg').innerHTML = ICON_USER_GEAR;
-  $('btnNet').innerHTML = ICON_NET;
-  $('btnNet').onclick = () => {
-    $('netModal').hidden = false;
-    renderNetTopo();
-    startTopoRefresh();
-  };
-  $('netClose').onclick = () => { $('netModal').hidden = true; stopTopoRefresh(); };
-  $('netModal').addEventListener('click', e => { if (e.target === $('netModal')) { $('netModal').hidden = true; stopTopoRefresh(); } });
-  bindTopoPan(); // 拓扑图拖动平移（内容放不下时）
-  $('btnNetJoin').onclick = async () => {
-    const remote = normJoinRemote($('netInput').value);
-    if (!remote) { $('netHint').textContent = '地址格式无效（示例：[2409:...]:7553）'; return; }
-    $('btnNetJoin').textContent = '连接中…';
-    $('btnNetJoin').disabled = true;
-    try {
-      const r = await fetch('/api/join', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ remote }) });
-      if (!r.ok) throw new Error((await r.text()).trim().split('\n')[0]);
-      $('netInput').value = '';
-    } catch (e) {
-      $('netHint').textContent = '连接失败：' + e.message;
-    } finally {
-      $('btnNetJoin').textContent = '连接';
-      $('btnNetJoin').disabled = false;
-    }
-  };
-  $('netInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnNetJoin').click(); });
   $('btnShareAddr').innerHTML = ICON_SHARE;
-  $('btnShareAddr').onclick = () => { // 分享观看地址：弹窗可选复制（本机 + 各互联主机）
+  $('btnShareAddr').onclick = () => { // 分享观看地址：弹窗可选复制
     renderShareList();
     $('shareModal').hidden = false;
   };
@@ -1061,7 +993,7 @@ function setMyName() {
   myName = $('nameInput').value.trim();
   localStorage.setItem('teashare_name', myName);
   if (ws && ws.readyState === WebSocket.OPEN) {
-    send({ type: 'hello', name: myName, enterHost: location.hostname.replace(/^\[|\]$/g, '') });
+    send({ type: 'hello', name: myName, enterHost: location.host });
   }
   renderMyCard();
 }
@@ -1078,7 +1010,7 @@ function connectWS() {
     refreshServerState(); // 重连后刷新服务器状态（serverStart/节点/拓扑，检测重启）
     $('netState').textContent = '已连接';
     sndReconnect();
-    send({ type: 'hello', name: myName || undefined, clientId: myClientId, enterHost: location.hostname.replace(/^\[|\]$/g, '') });
+    send({ type: 'hello', name: myName || undefined, clientId: myClientId, enterHost: location.host });
   };
   ws.onmessage = ev => { try { onMessage(JSON.parse(ev.data)); } catch (e) {} };
   ws.onclose = () => {
@@ -1100,12 +1032,7 @@ async function refreshServerState() {
     addrList = d.addrs || [];
     port = d.port || 7553;
     iceServers = d.iceServers || [];
-    nodeId = d.nodeId || '';
     myHostName = d.myHostName || '';
-    netNodes = d.nodes || [];
-    netTopo = d.topo || {};
-    myUsers = d.myUsers || [];
-    netLinkRtt = d.linkRtts || {};
     if (d.ipv6) ipv6Info = d.ipv6; // 主机 IPv6 检测结果（关于弹窗展示）
     checkProxyAccess(); // 穿透域名访问检测（每次页面加载询问一次；重连时 proxyAsked 已置位不再弹）
     if (d.serverStart) {
@@ -1157,37 +1084,11 @@ function checkProxyAccess() {
   $('proxyModal').hidden = false;
 }
 
-// 互联节点地址缓存（localStorage）：断线后引导切换到其他主机
-function saveNodeCache() {
-  try {
-    localStorage.setItem('teashare_nodes', JSON.stringify({ at: Date.now(), cur: location.origin, nodes: netNodes, rtts: hostRtts }));
-  } catch (e) {}
-}
-
 function showHostLostBanner() {
   const banner = $('hostLostBanner');
   if (!banner || banner.hidden === false) return;
-  let cache = null;
-  try { cache = JSON.parse(localStorage.getItem('teashare_nodes') || 'null'); } catch (e) {}
-  const nodes = (cache && cache.nodes) || [];
-  const others = nodes.filter(n => n.remote && n.remote !== location.origin);
   $('hostLostText').textContent = '当前主机连接已断开';
-  const btns = $('hostLostBtns');
-  if (others.length) {
-    // 按缓存延迟选最优节点（有 rtts 数据时标记「建议切换」）
-    const rtts = (cache && cache.rtts) || {};
-    const bestId = Object.keys(rtts).length ? others.reduce((a, b) => (rtts[b.id] || 9999) < (rtts[a.id] || 9999) ? b : a) : null;
-    btns.innerHTML = others.map(n => {
-      const url = 'https://' + (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-      const rec = bestId && bestId.id === n.id && rtts[n.id] > 0 ? '（建议切换 ' + rtts[n.id] + 'ms）' : '';
-      return `<button class="btn primary mini" data-open="${escapeHtml(url)}">打开互联主机${rec}</button>`;
-    }).join('');
-  } else {
-    btns.innerHTML = '';
-  }
-  btns.querySelectorAll('[data-open]').forEach(b => {
-    b.onclick = () => window.open(b.dataset.open, '_blank'); // 确认后打开其他主机
-  });
+  $('hostLostBtns').innerHTML = '';
   sndDisconnectThrottled(); // 主机断线横幅出现：提示音（节流）
   banner.hidden = false;
 }
@@ -1240,16 +1141,6 @@ function onMessage(m) {
       for (const [, p] of peers) { if (!p.host && !p.hostId) p.hostId = m.id; } // 服务运行者上线补填
       renderGrid();
       updateMyHostLine();
-      break;
-    case 'node-info':
-      if (m.nodeId) nodeId = m.nodeId; // /addrs 失败兜底：node-info 补全本节点 id
-      if (m.myHostName !== undefined) myHostName = m.myHostName || '';
-      netNodes = m.nodes || [];
-      if (m.topo) netTopo = m.topo;
-      if (m.myUsers) myUsers = m.myUsers;
-      if (m.linkRtts) netLinkRtt = m.linkRtts;
-      saveNodeCache(); // 互联节点变化时更新缓存
-      renderNetTopo();
       break;
     case 'stream-added':
       streamOwners.set(m.id, m.ownerId);
@@ -1316,13 +1207,11 @@ function onMessage(m) {
       for (const [id, rtt] of Object.entries(m.rtts || {})) {
         const el = document.getElementById('rtt-' + (id === myId ? 'me' : id));
         if (el) setRttBadge(el, rtt);
-        if (id === myId) myRtt = rtt;
-        else {
+        if (id !== myId) {
           const p = peers.get(id);
           if (p) p.rtt = rtt; // 缓存：renderGrid 重建后恢复
         }
       }
-      if (!$('netModal').hidden) renderNetTopo(); // 拓扑延迟标签实时刷新
       break;
     case 'watchers':
       if (m.ownerId === myId) myWatchers = m.count || 0;
@@ -1420,9 +1309,17 @@ async function handleSubscribeOffer(m) {
 
 /* ---------- 我的卡片 ---------- */
 
-// 全局节点编号 S1、S2…（所有节点含本节点按 nodeId 排序，序号跨节点一致；与卡片徽章/拓扑一致）
-function nodeSeqOf(id) {
-  return [nodeId, ...netNodes.map(n => n.id)].sort().indexOf(id) + 1;
+// 判断进入地址是否为域名（穿透访问）；IP/回环/localhost 视为直连
+function isDomainHost(h) {
+  if (!h) return false;
+  let s = String(h).replace(/^https?:\/\//, '').split('/')[0];
+  if (s.startsWith('[')) { const m = s.match(/^\[([^\]]+)\]/); if (m) s = m[1]; }
+  else if (s.includes(':')) s = s.slice(0, s.lastIndexOf(':'));
+  if (!s) return false;
+  if (s === 'localhost' || s === '127.0.0.1' || s === '::1') return false;
+  if (/^[\d.]+$/.test(s)) return false;                          // IPv4
+  if (s.includes(':')) return false;                             // IPv6
+  return /^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$/.test(s);            // 域名（含点）
 }
 
 function renderMyCard() {
@@ -1435,7 +1332,7 @@ function renderMyCard() {
     <div class="phead"><span class="dot" style="background:${myColor}"></span>
       <span class="pname">我${myName ? '（' + myName + '）' : ''}</span>
       <span class="pill" id="myPill" data-pill="me" data-joined="${pageStartTs}"><span data-pill-dur>在线: --</span><span data-pill-state> • ${pillStateTxt('me')}</span></span>
-      ${myIsHost ? `<span class="pill host">服务器主机 S${nodeSeqOf(nodeId) || '?'}</span>` : ''}
+      ${myIsHost ? `<span class="pill host">服务器主机</span>` : ''}
     </div>
     <span class="rttBadge" id="rtt-me">—</span>
     <video id="myVideo" autoplay playsinline muted hidden></video>
@@ -2391,7 +2288,6 @@ const ICON_CAM = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" str
 const ICON_MONITOR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>';
 const ICON_MONITOR_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="16" height="12" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="15" x2="12" y2="21"/><circle cx="19" cy="19" r="2.6"/><circle cx="19" cy="19" r="1"/></svg>';
 const ICON_USER_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="8" r="4"/><path d="M4 21v-2a6 6 0 0 1 12 0v2"/><circle cx="19" cy="19" r="2.6"/><circle cx="19" cy="19" r="1"/></svg>';
-const ICON_NET = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="7" height="7" rx="1.5"/><rect x="15" y="10" width="7" height="7" rx="1.5"/><path d="M5.5 14v3a2 2 0 0 0 2 2h5.5"/><path d="M18.5 10V8a2 2 0 0 0-2-2H10"/></svg>';
 const ICON_QUALITY_GEAR = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><circle cx="21" cy="21" r="2.2"/><circle cx="21" cy="21" r="0.8"/></svg>';
 const ICON_SHARE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><line x1="8.59" y1="13.51" x2="15.42" y2="17.49"/><line x1="15.41" y1="6.51" x2="8.59" y2="10.49"/></svg>';
 const ICON_SHIELD = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>';
@@ -2497,20 +2393,6 @@ function requestCtrl(streamId) {
   if (ctrlView && ctrlView.active) { releaseCtrl(); return; } // 已在控制：点击切换为释放
   const ownerId = streamOwners.get(streamId) || streamId;
   if (ownerId === myId) { flashMsg('不能控制自己'); return; }
-  // 远端主机流（owner id 含冒号=节点前缀）：输入在目标主机服务器执行，需先切换到该主机才能控制
-  if (ownerId.includes(':')) {
-    const node = ownerId.split(':')[0];
-    const n = netNodes.find(x => x.id === node);
-    const addr = n && n.remote ? (n.remote.startsWith('http') ? n.remote.replace(/^https?:\/\//, '') : n.remote) : '';
-    if (addr) {
-      openCtrlApply('切换到该主机',
-        `该屏幕属于互联主机 ${node}（${addr}），远程控制需切换到该主机后发起。\n\n是否在新标签页打开该主机？`,
-        '打开该主机', () => window.open('https://' + addr, '_blank'));
-    } else {
-      flashMsg('该屏幕属于互联主机，但未获取到其地址，无法切换');
-    }
-    return;
-  }
   openCtrlApply('远程控制',
     '确认申请远程控制？对方同意后你将获得鼠标/键盘控制权，可随时释放。\n\n注意：若对方共享的是副屏，鼠标操作可能无法作用于副屏画面（仅支持主屏）。',
     '申请控制', () => {
@@ -2573,6 +2455,61 @@ function closeLog() {
 function updateLogModeBtn() {
   $('logModeBtn').textContent = aboutVerbose ? '切换到正常模式' : '切换到调试模式';
   $('logModeTxt').textContent = aboutVerbose ? '当前：调试模式（详细日志）' : '当前：正常模式';
+}
+
+// 延迟角标：颜色分级（≤50 绿 / ≤150 黄 / >150 红；无数据 —）
+function setRttBadge(el, rtt) {
+  if (rtt == null || rtt <= 0) { el.textContent = '—'; el.style.color = ''; return; }
+  el.textContent = rtt + 'ms';
+  el.style.color = rtt <= 50 ? '#4ade80' : (rtt <= 150 ? '#fbbf24' : '#f87171');
+}
+
+// 关于弹窗：版本/服务器启动与运行时长/页面时长/缓存时间/日志模式/刷新状态
+function fmtDurMs(ms) {
+  if (!ms || ms <= 0) return '-';
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (d > 0) return `${d}天 ${h}小时 ${m}分`;
+  if (h > 0) return `${h}小时 ${m}分`;
+  if (m > 0) return `${m}分 ${sec}秒`;
+  return `${sec}秒`;
+}
+
+function renderAbout() {
+  $('aboutVer').textContent = appVer;
+  $('aboutStart').textContent = serverStart ? new Date(serverStart).toLocaleString() : '-';
+  const wsOpen = ws && ws.readyState === WebSocket.OPEN;
+  // 服务器已运行：仅连接正常时计算（断开时不再虚增，重连后 refreshServerState 更新 serverStart 恢复准确）
+  $('aboutUptime').textContent = wsOpen && serverStart ? fmtDurMs(Date.now() - serverStart) : '连接断开中';
+  $('aboutPageUp').textContent = fmtDurMs(Date.now() - pageStartTs);
+  // 本地缓存时间：本地存储的服务器启动时间戳（刷新判断用）
+  let cacheTxt = '-';
+  try {
+    const sc = localStorage.getItem('teashare_server_start');
+    if (sc) cacheTxt = new Date(Number(sc)).toLocaleString();
+  } catch (e) {}
+  $('aboutCache').textContent = cacheTxt;
+  // 主机网络检测（服务器所在电脑的 IPv6/IPv4 状态，refreshServerState 经 /addrs 获取）
+  const v6 = ipv6Info || {};
+  const v6Addrs = (v6.localAddrs && v6.localAddrs.length) ? v6.localAddrs.join(', ') : '无（对方将无法通过 IPv6 访问）';
+  $('aboutIpv6Addrs').textContent = v6Addrs;
+  $('aboutIpv6Route').innerHTML = v6.route ? '<span class="ok">可用（可出站）</span>' : '<span class="warn">不可用</span>';
+  $('aboutIpv6Public').innerHTML = v6.public
+    ? `<span class="ok">可达</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
+    : '<span class="warn">不可达</span>';
+  $('aboutIpv6Public4').textContent = v6.publicIPv4 || '不可达';
+  // IPv6 场景提示（与「分享观看地址」弹窗同一内容；访问地址取首个真实 IPv6，无则公网 IPv4）
+  let aboutVisit = location.origin;
+  if (addrList.length) aboutVisit = `https://[${addrList[0]}]:${port}`;
+  else if (v6.publicIPv4) aboutVisit = `https://${v6.publicIPv4}:${port}`;
+  renderIpv6Hint($('aboutIpv6Hint'), $('aboutIpv6CopyRow'), $('aboutIpv6CopyBtn'), aboutVisit);
+  // 服务器重启状态（refreshServerState 检测；断开重连期间也能感知）
+  $('aboutRefresh').hidden = !serverRestarted;
+  if (!aboutTimer) aboutTimer = setInterval(renderAbout, 1000);
+}
+
+function stopAboutTimer() {
+  if (aboutTimer) { clearInterval(aboutTimer); aboutTimer = null; }
 }
 
 function appendLogLine(line) {
@@ -3014,9 +2951,6 @@ function rebuildGrid() {
   const mine = document.getElementById('myCard');
   const hostMap = new Map([...peers.values()].filter(p => p.host).map(p => [p.id, p]));
   if (myIsHost) hostMap.set(myId, { id: myId, name: myName, host: true }); // welcome.peers 不含自己，host 需自补
-  // 服务器主机全局编号：所有节点（含本节点）按 nodeId 排序，序号跨节点一致（S1、S2…）
-  const nodeSeq = {};
-  [nodeId, ...netNodes.map(n => n.id)].sort().forEach((nid, i) => { nodeSeq[nid] = i + 1; });
   grid.innerHTML = '';
   if (mine) grid.appendChild(mine);
   for (const [id, info] of peers) {
@@ -3037,9 +2971,8 @@ function rebuildGrid() {
     const hasVideo = sharing && !!vCached;
     const hasAudioStream = !!audioStreamId;
     const pill = `<span class="pill ${(sharing || camSharing || hasAudioStream) ? 'on' : ''}" data-pill="${id}" data-joined="${info.joinedAt || 0}"><span data-pill-dur>在线: --</span><span data-pill-state> • ${pillStateTxt(id)}</span></span>`;
-    // 服务运行者徽章带全局节点编号：本地 host 属本节点（nodeId）；远端 host 属其 id 前缀节点
-    const hostNode = info.id.includes(':') ? info.id.split(':')[0] : nodeId;
-    const hostPill = info.host ? `<span class="pill host">服务器主机 S${nodeSeq[hostNode] || '?'}</span>` : '';
+    // 服务运行者徽章（单机：本服务器运行者）
+    const hostPill = info.host ? `<span class="pill host">服务器主机</span>` : '';
     // 该用户所属节点的服务运行者；hostId 失效（host 重连换 id）时回退本节点当前 host
     const hostPeer = hostMap.get(info.hostId) || [...hostMap.values()][0];
     card.innerHTML = `
@@ -3054,7 +2987,7 @@ function rebuildGrid() {
         <div class="audioBar" data-audio-bar="${id}"></div>` : ''}
       <div class="pbody">
         ${(myIsHost && myStream) ? `<div class="inviteRow"><button class="btn mini" data-invite-card="${id}">邀请控制</button></div>` : ''}
-        <p class="stats">对方 IP：${info.ip || '-'} - 主机：${hostPeer ? hostPeer.name : (info.enterHost || addrList[0] || '-')}</p>
+        <p class="stats">对方 IP：${info.ip && !isDomainHost(info.enterHost) ? info.ip : (isDomainHost(info.enterHost) ? '穿透域名访问' : (info.ip || '-'))} - 主机：${hostPeer ? hostPeer.name : (info.enterHost || addrList[0] || '-')}</p>
         <dl class="kv" id="detail-${id}" hidden></dl>
         ${camSharing ? `<dl class="kv" id="detail-${id}-cam" hidden></dl>` : ''}
       </div>`;
@@ -3605,7 +3538,7 @@ function fallbackCopy(txt, done) {
 }
 
 function renderAddrs() {
-  if (!addrList.length && !netNodes.length) return; // 无可用地址时跳过
+  if (!addrList.length) return; // 无可用地址时跳过
   const pwshCmd =
     `curl.exe -k -o "$env:TEMP\\teashare-ca.crt" "https://[${addrList[0]}]:${port}/ca.crt"; ` +
     `Import-Certificate -FilePath "$env:TEMP\\teashare-ca.crt" -CertStoreLocation Cert:\\CurrentUser\\Root`;
@@ -3629,27 +3562,20 @@ function renderAddrs() {
   };
 }
 
-// 分享地址列表：本机（S1，IPv6 + 公网 IPv4）+ 各互联主机（全局编号与卡片/拓扑一致），单个或全部复制
+// 分享地址列表：本机（IPv6 + 公网 IPv4 兜底），单个或全部复制
 function buildShareUrls() {
   const list = [];
   const seenUrls = new Set();
-  const seq = {};
-  [nodeId, ...netNodes.map(n => n.id)].sort().forEach((nid, i) => { seq[nid] = i + 1; });
-  const selfSeq = seq[nodeId] || 1;
   addrList.forEach(a => {
     const url = `https://[${a}]:${port}`;
-    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + selfSeq + '（本机）', url }); }
+    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: '本机（IPv6）', url }); }
   });
   // 公网 IPv4 可达时也提供（无 IPv6 场景的兜底入口，避免复制出 localhost 无效地址）
   const v4 = (ipv6Info && ipv6Info.publicIPv4) || '';
   if (v4 && !addrList.length) {
     const url = `https://${v4}:${port}`;
-    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + selfSeq + '（本机 IPv4）', url }); }
+    if (!seenUrls.has(url)) { seenUrls.add(url); list.push({ label: '本机（公网 IPv4）', url }); }
   }
-  netNodes.forEach(n => {
-    const url = 'https://' + (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-    if (url && !seenUrls.has(url)) { seenUrls.add(url); list.push({ label: 'S' + (seq[n.id] || '?'), url }); }
-  });
   return list;
 }
 
@@ -3721,461 +3647,6 @@ function renderShareList() {
   renderIpv6Hint($('shareIpv6Hint'), $('shareIpv6CopyRow'), $('shareIpv6CopyBtn'), list.length ? list[0].url : location.origin);
 }
 
-// 多主机自动互联：页面地址自带对方 IPv6（location.origin），本机若运行服务则自动连入该节点
-// 本机端口约定 7553（默认端口；自定义 -port 时自动失败，可用组网弹窗手动互联）
-function autoJoinLocal() {
-  const hn = location.hostname.replace(/^\[|\]$/g, '');
-  if (hn === '127.0.0.1' || hn === '::1' || hn === 'localhost') return; // 本机自测页面：本机即当前节点
-  // 必须用 https（服务仅 TLS）+ localhost（Safari 混合内容豁免；跑服务的主机必然已装本机 CA）
-  fetch('https://localhost:7553/api/join', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ remote: location.origin }),
-  }).then(r => {
-    if (!r.ok) console.warn('自动互联失败：', r.status, r.statusText);
-  }).catch(e => console.warn('自动互联失败：', e.message)); // 本机无服务/被拦截：仅诊断日志
-}
-
-// 延迟角标：颜色分级（≤50 绿 / ≤150 黄 / >150 红；无数据 —）
-function setRttBadge(el, rtt) {
-  if (rtt == null || rtt <= 0) { el.textContent = '—'; el.style.color = ''; return; }
-  el.textContent = rtt + 'ms';
-  el.style.color = rtt <= 50 ? '#4ade80' : (rtt <= 150 ? '#fbbf24' : '#f87171');
-}
-
-// 手动互联地址归一化：http→https、IPv6 补方括号、无端口补本机端口、去斜杠
-function normJoinRemote(raw) {
-  let s = (raw || '').trim();
-  if (!s) return '';
-  s = s.replace(/^http:\/\//i, 'https://');
-  if (!/^https:\/\//i.test(s)) s = 'https://' + s;
-  // IPv6 无方括号：先试整串作为合法 IPv6 地址（无端口）；失败再拆最后数字段作端口
-  const m = s.match(/^https:\/\/([^/?#]+)/i);
-  if (m) {
-    let host = m[1];
-    if (!host.startsWith('[') && (host.match(/:/g) || []).length >= 2) {
-      const full = '[' + host + ']';
-      try { new URL('https://' + full); host = full; }
-      catch (e2) {
-        const parts = host.split(':');
-        const last = parts[parts.length - 1];
-        if (/^\d+$/.test(last) && last.length <= 5 && Number(last) < 65536) {
-          const joined = '[' + parts.slice(0, -1).join(':') + ']';
-          try { new URL('https://' + joined); host = joined + ':' + last; } catch (e3) {}
-        }
-      }
-      s = 'https://' + host + s.slice(m[0].length);
-    }
-  }
-  try {
-    const u = new URL(s);
-    if (!u.port) u.port = String(port || 7553); // 无端口补本节点端口
-    return u.origin; // 去尾部斜杠
-  } catch (e) {
-    return '';
-  }
-}
-
-// 拓扑弹窗周期刷新（5s）：拉取最新节点/矩阵 + 真实测量各主机延迟
-function startTopoRefresh() {
-  if (topoTimer) return;
-  topoTimer = setInterval(async () => {
-    try {
-      const r = await fetch('/addrs');
-      const d = await r.json();
-      nodeId = d.nodeId || nodeId;
-      myHostName = d.myHostName || '';
-      netNodes = d.nodes || [];
-      netTopo = d.topo || {};
-      myUsers = d.myUsers || [];
-      netLinkRtt = d.linkRtts || {};
-    } catch (e) {}
-    await measureHostRtts();
-    renderNetTopo();
-  }, 5000);
-}
-function stopTopoRefresh() {
-  if (topoTimer) { clearInterval(topoTimer); topoTimer = null; }
-}
-
-// 真实测量自己的浏览器到各互联主机的延迟（fetch /api/ping，3s 超时；每 5s 刷新）
-async function measureHostRtts() {
-  for (const n of netNodes) {
-    if (!n.remote) continue;
-    const url = 'https://' + (n.remote.startsWith('http') ? n.remote.replace(/^https?:\/\//, '') : n.remote);
-    const t0 = Date.now();
-    try {
-      const ctl = new AbortController();
-      const tm = setTimeout(() => ctl.abort(), 3000);
-      const r = await fetch(url + '/api/ping', { cache: 'no-store', mode: 'cors', signal: ctl.signal });
-      clearTimeout(tm);
-      if (r.ok) hostRtts[n.id] = Date.now() - t0; // 失败保留旧值
-    } catch (e) {}
-  }
-}
-
-// 用户到各互联主机的延迟列表（自己真实测量，他人近似 = 母节点延迟 + 节点间延迟）
-function userHostRttList(u, isSelf, hostId) {
-  const list = [];
-  const base = isSelf ? myRtt : (peers.get(u.id) ? peers.get(u.id).rtt : 0);
-  const targets = [nodeId, ...netNodes.map(x => x.id)].filter(x => x && x !== hostId);
-  for (const x of targets) {
-    let ms = 0;
-    if (isSelf) {
-      ms = hostRtts[x] || 0; // 真实测量
-    } else {
-      const link = (netLinkRtt[hostId] || {})[x] || 0; // 节点间延迟矩阵
-      ms = base > 0 && link > 0 ? base + link : 0;
-    }
-    if (ms > 0) list.push({ id: x, ms });
-  }
-  return list;
-}
-
-// 拓扑图拖动平移（内容放不下时拖动查看；触摸/鼠标均支持）
-function bindTopoPan() {
-  const wrap = $('netTopoWrap');
-  const svg = $('netTopo');
-  if (!wrap || !svg) return;
-  svg.addEventListener('pointerdown', e => {
-    panState.on = true; panState.moved = false;
-    panState.sx = e.clientX; panState.sy = e.clientY;
-    panState.ox = topoVB ? topoVB.x : 0;
-    panState.oy = topoVB ? topoVB.y : 0;
-    try { svg.setPointerCapture(e.pointerId); } catch (err) {}
-  });
-  svg.addEventListener('pointermove', e => {
-    if (!panState.on) return;
-    const dx = e.clientX - panState.sx, dy = e.clientY - panState.sy;
-    if (Math.abs(dx) + Math.abs(dy) > 6) panState.moved = true;
-    const vb = svg.viewBox.baseVal;
-    const kx = svg.clientWidth ? vb.width / svg.clientWidth : 1;
-    const ky = svg.clientHeight ? vb.height / svg.clientHeight : 1;
-    if (topoVB) {
-      topoVB.x = panState.ox - dx * kx;
-      topoVB.y = panState.oy - dy * ky;
-    }
-    vb.x = topoVB ? topoVB.x : 0;
-    vb.y = topoVB ? topoVB.y : 0;
-    if (panState.moved) wrap.classList.add('dragging');
-  });
-  const end = () => { panState.on = false; wrap.classList.remove('dragging'); };
-  svg.addEventListener('pointerup', end);
-  svg.addEventListener('pointercancel', end);
-  // 拖动结束抑制 click（避免误触选中/取消）
-  svg.addEventListener('click', e => {
-    if (panState.moved) { e.stopPropagation(); e.preventDefault(); panState.moved = false; }
-  }, true);
-  // 双击恢复默认视图
-  svg.addEventListener('dblclick', () => { topoVB = null; renderNetTopo(); });
-}
-
-// 关于弹窗：版本/服务器启动与运行时长/页面时长/缓存时间/日志模式/刷新状态
-function fmtDurMs(ms) {
-  if (!ms || ms <= 0) return '-';
-  const s = Math.floor(ms / 1000);
-  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  if (d > 0) return `${d}天 ${h}小时 ${m}分`;
-  if (h > 0) return `${h}小时 ${m}分`;
-  if (m > 0) return `${m}分 ${sec}秒`;
-  return `${sec}秒`;
-}
-function renderAbout() {
-  $('aboutVer').textContent = appVer;
-  $('aboutStart').textContent = serverStart ? new Date(serverStart).toLocaleString() : '-';
-  const wsOpen = ws && ws.readyState === WebSocket.OPEN;
-  // 服务器已运行：仅连接正常时计算（断开时不再虚增，重连后 refreshServerState 更新 serverStart 恢复准确）
-  $('aboutUptime').textContent = wsOpen && serverStart ? fmtDurMs(Date.now() - serverStart) : '连接断开中';
-  $('aboutPageUp').textContent = fmtDurMs(Date.now() - pageStartTs);
-  let cacheTxt = '-';
-  try {
-    const nc = JSON.parse(localStorage.getItem('teashare_nodes') || 'null');
-    if (nc && nc.at) cacheTxt = new Date(nc.at).toLocaleString();
-  } catch (e) {}
-  $('aboutCache').textContent = cacheTxt;
-  // 主机网络检测（服务器所在电脑的 IPv6/IPv4 状态，refreshServerState 从 /addrs 获取）
-  const v6 = ipv6Info || {};
-  const v6Addrs = (v6.localAddrs && v6.localAddrs.length) ? v6.localAddrs.join(', ') : '无（对方将无法通过 IPv6 访问）';
-  $('aboutIpv6Addrs').textContent = v6Addrs;
-  $('aboutIpv6Route').innerHTML = v6.route ? '<span class="ok">可用（可出站）</span>' : '<span class="warn">不可用</span>';
-  $('aboutIpv6Public').innerHTML = v6.public
-    ? `<span class="ok">可达</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
-    : '<span class="warn">不可达</span>';
-  $('aboutIpv6Public4').textContent = v6.publicIPv4 || '不可达';
-  // IPv6 场景提示（与「分享观看地址」弹窗同一内容；访问地址取首个真实 IPv6，无则公网 IPv4）
-  let aboutVisit = location.origin;
-  if (addrList.length) aboutVisit = `https://[${addrList[0]}]:${port}`;
-  else if (v6.publicIPv4) aboutVisit = `https://${v6.publicIPv4}:${port}`;
-  renderIpv6Hint($('aboutIpv6Hint'), $('aboutIpv6CopyRow'), $('aboutIpv6CopyBtn'), aboutVisit);
-  // 服务器重启状态（refreshServerState 检测；断开重连期间也能感知）
-  $('aboutRefresh').hidden = !serverRestarted;
-  if (!aboutTimer) aboutTimer = setInterval(renderAbout, 1000);
-}
-function stopAboutTimer() {
-  if (aboutTimer) { clearInterval(aboutTimer); aboutTimer = null; }
-}
-
-// 互联拓扑图（星图风格）：金色主机环形排布 + 主机间金色连线 + 子用户星点扇形连线挂载
-function renderNetTopo() {
-  const svg = $('netTopo');
-  const act = $('netAction');
-  if (!svg) return;
-  const W = 560, H = 340, cx = W / 2, cy = H / 2;
-  const GOLD = '#fbbf24';
-  const selfId = nodeId || 'self'; // nodeId 缺失兜底：仍渲染本节点圆
-  const ids = [];
-  const addrOf = {};
-  const usersOf = {};
-  if (selfId) {
-    ids.push(selfId);
-    addrOf[selfId] = location.origin;
-    // 自己的用户点：host（服务运行者）由主机圆代表不单独显示；纯浏览用户需显示并高亮自己
-    usersOf[selfId] = myUsers.filter(u => !(myIsHost && u.id === myId));
-  }
-  netNodes.forEach(n => {
-    ids.push(n.id);
-    addrOf[n.id] = (n.remote || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-    usersOf[n.id] = (n.users || []).filter(u => u.id !== myId);
-  });
-  if (ids.length <= 1 && !myUsers.length) {
-    svg.innerHTML = `<text x="${cx}" y="${cy}" text-anchor="middle" fill="#8fa3c4" font-size="13">暂无节点信息</text>`;
-    act.innerHTML = '';
-    return;
-  }
-  const R = Math.min(90, 44 + ids.length * 12); // 主机环形半径
-  const hostR = 30; // 主机圆半径
-  const nodeSeq = {};
-  [...ids].sort().forEach((nid, i) => { nodeSeq[nid] = i + 1; }); // 全局编号 S1、S2…（与卡片徽章一致）
-  const pos = {};
-  ids.forEach((id, i) => {
-    const a = (2 * Math.PI * i) / ids.length + Math.PI; // 起点在左侧（2 台主机时为左右分布）
-    pos[id] = { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a), a };
-  });
-  // 主机间连线（金色，去重）+ 延迟标签防重叠放置（沿连线参数化 + 碰撞避让）
-  const seen = new Set();
-  const lines = [];
-  for (const [id, nbs] of Object.entries(netTopo)) {
-    for (const nb of nbs) {
-      if (!pos[id] || !pos[nb]) continue;
-      const key = id < nb ? id + '|' + nb : nb + '|' + id;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      // 直连延迟：本节点侧优先（nodes.rtt），否则用矩阵（他人视角）
-      let lr = 0;
-      if (id === selfId) lr = (netNodes.find(x => x.id === nb) || {}).rtt || 0;
-      else if (nb === selfId) lr = (netNodes.find(x => x.id === id) || {}).rtt || 0;
-      else lr = (netLinkRtt[id] || {})[nb] || 0;
-      lines.push({ x1: pos[id].x, y1: pos[id].y, x2: pos[nb].x, y2: pos[nb].y, lr });
-    }
-  }
-  const links = lines.map(l => `<line class="topoLink" x1="${l.x1}" y1="${l.y1}" x2="${l.x2}" y2="${l.y2}"/>`);
-  // 延迟标签：沿连线 t∈[0.3,0.7] 扫描避让（标签/主机圆），失败则沿法线错开，最终兜底中点
-  const labelRects = [];
-  const rect = (x, y, w, h) => ({ x: x - w / 2, y: y - h / 2, w, h });
-  const collide = r => labelRects.some(o => r.x < o.x + o.w && r.x + r.w > o.x && r.y < o.y + o.h && r.y + r.h > o.y);
-  lines.forEach(l => {
-    if (l.lr <= 0) return;
-    const txt = l.lr + 'ms';
-    const w = txt.length * 6 + 8, h = 12;
-    const dx = l.x2 - l.x1, dy = l.y2 - l.y1;
-    const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len, uy = dy / len;
-    let placed = false;
-    for (let i = 0; i < 16 && !placed; i++) {
-      const t = 0.3 + i * (0.4 / 15);
-      const px = l.x1 + dx * t, py = l.y1 + dy * t;
-      let onHost = false;
-      for (const hp of Object.values(pos)) {
-        if (Math.hypot(px - hp.x, py - hp.y) < hostR + h / 2 + 2) { onHost = true; break; }
-      }
-      const r = rect(px, py + 3, w, h);
-      if (!onHost && !collide(r)) {
-        links.push(`<text x="${px}" y="${py + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
-        labelRects.push(r);
-        placed = true;
-      }
-    }
-    if (!placed) { // 沿法线错开（兜底）
-      const nx = -uy, ny = ux;
-      for (let off = 4; off <= 16 && !placed; off += 4) {
-        for (const s of [1, -1]) {
-          const px = (l.x1 + l.x2) / 2 + nx * off * s, py = (l.y1 + l.y2) / 2 + ny * off * s;
-          const r = rect(px, py + 3, w, h);
-          if (!collide(r)) {
-            links.push(`<text x="${px}" y="${py + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
-            labelRects.push(r);
-            placed = true;
-          }
-        }
-      }
-    }
-    if (!placed) { // 最终兜底：中点（重叠可接受）
-      links.push(`<text x="${(l.x1 + l.x2) / 2}" y="${(l.y1 + l.y2) / 2 + 3}" font-size="9" fill="#fde68a" text-anchor="middle" pointer-events="none" stroke="#0f172a" stroke-width="3" paint-order="stroke">${txt}</text>`);
-    }
-  });
-  // 主机节点 + 全部子用户星点（多层扇形辐射，细线连到主机，点居中于标签正下方）
-  const perLayer = 4;
-  const out = [];
-  // 收集子用户（位置 + 标签文本）
-  const userItems = [];
-  ids.forEach(id => {
-    const p = pos[id];
-    const isSelf = id === selfId;
-    const allUsers = usersOf[id] || [];
-    allUsers.forEach((u, j) => {
-      const layer = Math.floor(j / perLayer);
-      const inLayer = j % perLayer;
-      const m = Math.min(perLayer, allUsers.length - layer * perLayer);
-      const spread = m > 1 ? (inLayer / (m - 1) - 0.5) * (Math.PI * 110 / 180) : 0;
-      const ang = p.a + spread;
-      const dist = hostR + 46 + layer * 26;
-      const ux = p.x + dist * Math.cos(ang);
-      const uy = p.y + dist * Math.sin(ang);
-      const rtt = u.id === myId ? myRtt : (peers.get(u.id) ? peers.get(u.id).rtt : 0); // 自己的延迟存于 myRtt（peers 不含自己）
-      const isMe = isSelf && u.id === myId;
-      // 到所有其他主机的延迟：自己真实测量，他人近似（母节点延迟 + 节点间延迟矩阵）
-      const hostDl = userHostRttList(u, isMe, id).map(t => `| ${t.id.slice(0, 4)} ${t.ms}ms`).join(' ');
-      const label = `${escapeHtml((u.name || u.id).slice(0, isMe ? 6 : 8))}${isMe ? '（我）' : ''} ${rtt > 0 ? rtt + 'ms' : '—'}${hostDl ? ' ' + hostDl : ''}`;
-      userItems.push({ u, ux, uy, ang, label, isMe, rtt, isSelf, hostX: p.x, hostY: p.y });
-    });
-  });
-  // 标签碰撞放置：点正上方/下方居中 + 径向距离递增；检测连线延迟标签/主机圆/其他用户点（不检测连线）
-  const placedUserPts = [];
-  const rectOf = (x, y, w, h) => ({ x: x - w / 2, y: y - h / 2, w, h });
-  const overlap = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
-  const vsCircle = (r, cx, cy, cr) => {
-    const nx = Math.max(r.x, Math.min(cx, r.x + r.w));
-    const ny = Math.max(r.y, Math.min(cy, r.y + r.h));
-    return Math.hypot(cx - nx, cy - ny) < cr;
-  };
-  userItems.forEach(it => {
-    const w = it.label.length * 6.2 + 8, h = 14;
-    let best = null, bestScore = Infinity;
-    for (let di = 0; di <= 2; di++) {
-      const d = di * 10;
-      const px = it.ux + Math.cos(it.ang) * d;
-      const py = it.uy + Math.sin(it.ang) * d;
-      for (const up of [true, false]) {
-        const r = rectOf(px, py, w, h);
-        r.y = up ? py - 18 - h / 2 : py + 24 - h / 2;
-        let score = 0;
-        for (const hp of Object.values(pos)) if (vsCircle(r, hp.x, hp.y, hostR + 2)) score += 100;
-        for (const o of labelRects) if (overlap(r, o)) score += 100;
-        for (const op of placedUserPts) if (vsCircle(r, op.x, op.y, 10)) score += 100;
-        if (score < bestScore) { bestScore = score; best = { px, py, up, r }; }
-      }
-    }
-    it.px = best.px; it.py = best.py; it.up = best.up; it.r = best.r;
-    labelRects.push(best.r);
-    placedUserPts.push({ x: it.ux, y: it.uy });
-  });
-  // 动态 viewBox 自适应：最大内容半径 + 标签包围盒（长标签不裁切）
-  let maxContent = R + hostR + 46;
-  for (const id of ids) {
-    const layers = Math.max(1, Math.ceil((usersOf[id] || []).length / perLayer));
-    const mr = R + hostR + 46 + (layers - 1) * 26;
-    if (mr > maxContent) maxContent = mr;
-  }
-  userItems.forEach(it => {
-    const r = it.r;
-    const extent = Math.hypot(Math.max(Math.abs(r.x), Math.abs(r.x + r.w)), Math.max(Math.abs(r.y), Math.abs(r.y + r.h)));
-    if (extent > maxContent) maxContent = extent;
-  });
-  const vbW = Math.max(560, Math.ceil(maxContent * 2 + 80));
-  const vbH = Math.round(vbW * 340 / 560);
-  // 节点组成/画布尺寸变化时重置视图；否则保持用户平移/双击恢复后的视图
-  if (!topoVB || topoVB.ids !== ids.join(',') || topoVB.w !== vbW) {
-    topoVB = { ids: ids.join(','), x: 0, y: 0, w: vbW, h: vbH };
-  }
-  svg.setAttribute('viewBox', `${topoVB.x} ${topoVB.y} ${topoVB.w} ${topoVB.h}`);
-  // 渲染子用户（连线 + 点 + 居中标签）
-  userItems.forEach(it => {
-    out.push(`<line class="userLink" x1="${it.hostX + hostR * Math.cos(it.ang)}" y1="${it.hostY + hostR * Math.sin(it.ang)}" x2="${it.ux}" y2="${it.uy}"/>`);
-    out.push(`<g class="topoUser${it.isMe ? ' self' : ''}">${it.isMe ? '<circle class="glow" cx="' + it.ux + '" cy="' + it.uy + '" r="13"/>' : ''}<circle cx="${it.ux}" cy="${it.uy}" r="8"/>
-      <title>${escapeHtml(it.u.name || it.u.id)}（${it.rtt > 0 ? it.rtt + 'ms' : '—'}）${it.isMe ? '（我）' : ''}</title></g>
-      <text x="${it.px}" y="${it.r.y + 11}" font-size="10" fill="#e2e8f0" text-anchor="middle" pointer-events="none">${it.label}</text>`);
-  });
-  // 主机圆（金色，本节点加光晕；圆内标注全局序号 S{n} + 标识，延迟入 title）
-  ids.forEach(id => {
-    const p = pos[id];
-    const isSelf = id === selfId;
-    const allUsers = usersOf[id] || [];
-    const sLabel = 'S' + (nodeSeq[id] || '?');
-    const idShort = isSelf ? (myHostName || '主机').slice(0, 4) + ((myHostName || '').length > 4 ? '…' : '') : id.slice(0, 4);
-    // 圆内延迟：我→该主机的延迟（本节点 = myRtt 服务器实测；远端 = hostRtts 真实测量，未测到显示 —）
-    const hostDelay = isSelf ? myRtt : (hostRtts[id] || 0);
-    // 切换主机推荐：远端主机延迟显著优于当前主机（差值 >20ms）→ 标注「推荐」
-    const recTxt = (!isSelf && hostDelay > 0 && myRtt > 0 && hostDelay + 20 < myRtt)
-      ? '<text y="-44" font-size="9" fill="#4ade80" font-weight="700">推荐</text>' : '';
-    out.push(`<g class="topoNode${netSel === id ? ' sel' : ''}" data-node="${id}" transform="translate(${p.x},${p.y})">
-      ${recTxt}
-      ${isSelf ? '<circle r="42" fill="none" stroke="rgba(251,191,36,0.3)" stroke-width="2"/>' : ''}
-      <circle r="${hostR}" fill="rgba(251,191,36,0.16)" stroke="${GOLD}" stroke-width="2"/>
-      <text y="-11" font-size="12" font-weight="700">${escapeHtml(sLabel)}</text>
-      <text y="2" font-size="8" fill="#fde68a">${escapeHtml(idShort)}</text>
-      <text y="13" font-size="8" fill="#fde68a">${hostDelay > 0 ? hostDelay + 'ms' : '—'}</text>
-      <title>${isSelf ? '本节点 ' + (nodeId || myHostName || '主机') + '（' + allUsers.length + ' 用户）' + (myRtt > 0 ? '，延迟 ' + myRtt + 'ms' : '') : '主机 ' + sLabel + '：' + (addrOf[id] || '') + '（' + allUsers.length + ' 用户）' + (hostDelay > 0 ? '，延迟 ' + hostDelay + 'ms' : '') + (recTxt ? '，推荐切换' : '')}</title>
-    </g>`);
-  });
-  svg.innerHTML = links.join('') + out.join('');
-  svg.onclick = () => { netSel = null; renderNetTopo(); };
-  svg.querySelectorAll('.topoNode').forEach(g => {
-    g.onclick = e => {
-      e.stopPropagation();
-      netSel = g.dataset.node;
-      renderNetTopo();
-    };
-  });
-  // 操作栏：总览 + 选中主机（含本机）→ 打开/切换
-  const totalUsers = myUsers.length + netNodes.reduce((s, n) => s + (n.users ? n.users.length : 0), 0);
-  if (netSel) {
-    const addr = addrOf[netSel] || '';
-    const isSelf = netSel === selfId;
-    act.innerHTML = `已选主机 <b>${escapeHtml(netSel)}</b>（${escapeHtml(addr)}）<button class="btn primary" id="btnSwitchNode">${isSelf ? '打开本机页面' : '切换到该主机'}</button>`;
-    const btn = $('btnSwitchNode');
-    if (btn) btn.onclick = () => {
-      const target = addr.startsWith('http') ? addr : 'https://' + addr;
-      openCtrlApply(isSelf ? '打开本机页面' : '切换到该主机',
-        `是否在新标签页打开该主机？\n${addr}`,
-        isSelf ? '打开' : '切换', () => window.open(target, '_blank'));
-    };
-  } else {
-    let ops = `<span style="font-size:12px;color:#8fa3c4">${netNodes.length} 台互联主机 · 在线用户 ${totalUsers} 人${netNodes.length ? '，点击主机可切换' : ''}</span>`;
-    // 退出互联（仅本机管理者）：本机页面直调本服务；非本机页面经 localhost 探测本机服务
-    const hn = location.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-    const isLocalPage = hn === 'localhost' || hn === '127.0.0.1' || hn === '::1';
-    if (isLocalPage && myIsHost && netNodes.length) {
-      ops += ' <button class="btn mini" id="btnExitNet">退出互联</button>';
-    } else if (!isLocalPage) {
-      fetch('https://localhost:7553/api/node-state', { cache: 'no-store' })
-        .then(r => r.json()).then(s => {
-          if (s && s.connected > 0 && !document.getElementById('btnExitNet')) {
-            const b = document.createElement('button');
-            b.className = 'btn mini';
-            b.id = 'btnExitNet';
-            b.textContent = '退出互联并切换为本机页面';
-            b.onclick = async () => {
-              try {
-                const r2 = await fetch('https://localhost:7553/api/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-                if (r2.ok) location.href = 'https://localhost:7553'; // 当前标签页跳转本机页面
-                else flashMsg('断开本机互联失败');
-              } catch (e) { flashMsg('无法连接本机服务'); }
-            };
-            act.appendChild(b);
-          }
-        }).catch(() => {});
-    }
-    act.innerHTML = ops;
-    const bn = $('btnExitNet');
-    if (bn && isLocalPage) bn.onclick = async () => {
-      try {
-        const r = await fetch('/api/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' } });
-        if (r.ok) renderNetTopo();
-        else flashMsg('退出互联失败');
-      } catch (e) { flashMsg('退出互联失败'); }
-    };
-  }
-}
 </script>
 </body>
 </html>

@@ -21,12 +21,14 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -133,11 +135,6 @@ func main() {
 		w.Write(iconPNG)
 	})
 	mux.HandleFunc("/ws", h.serveWS)
-	mux.HandleFunc("/node-ws", h.serveNodeWS)
-	mux.HandleFunc("/api/join", h.handleJoin)
-	mux.HandleFunc("/api/join-token", h.handleJoinToken)
-	mux.HandleFunc("/api/node-state", h.handleNodeState)
-	mux.HandleFunc("/api/disconnect", h.handleDisconnect)
 	mux.HandleFunc("/api/ping", func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		if origin == "" {
@@ -168,7 +165,7 @@ func main() {
 		ipv6Mu.RLock()
 		ipv6 := ipv6Info
 		ipv6Mu.RUnlock()
-		json.NewEncoder(w).Encode(map[string]any{"addrs": addrs, "port": *port, "iceServers": ice, "nodeId": h.nodeId, "myHostName": h.myHostName(), "nodes": h.nodeInfoList(), "topo": h.topoSnapshot(), "myUsers": h.myUserList(), "linkRtts": h.linkRttSnapshot(), "version": appVersion, "serverStart": h.serverStart, "ipv6": ipv6})
+		json.NewEncoder(w).Encode(map[string]any{"addrs": addrs, "port": *port, "iceServers": ice, "myHostName": h.myHostName(), "version": appVersion, "serverStart": h.serverStart, "ipv6": ipv6})
 	})
 
 	srv := &http.Server{
@@ -207,7 +204,7 @@ func main() {
 	log.Printf(" 本机自测:      https://127.0.0.1:%d", *port)
 	log.Println(" CA 证书:       certs\\ca.crt （对方安装后访问无警告）")
 	log.Println("----------------------------------------------")
-	log.Printf(" 若对方连不上，请以管理员执行防火墙放行:\n   netsh advfirewall firewall add rule name=\"TeaShare-%d\" dir=in action=allow protocol=TCP localport=%d\n   netsh advfirewall firewall add rule name=\"TeaShare-turn-%d\" dir=in action=allow protocol=TCP localport=%d", *port, *port, *turnPort, *turnPort)
+	log.Printf(" 若对方连不上，请以管理员执行防火墙放行（脚本已自动尝试）:\n   netsh advfirewall firewall add rule name=\"TeaShare-%d\" dir=in action=allow protocol=TCP localport=%d\n   netsh advfirewall firewall add rule name=\"TeaShare-%d-UDP\" dir=in action=allow protocol=UDP localport=%d\n   netsh advfirewall firewall add rule name=\"TeaShare-turn-%d\" dir=in action=allow protocol=TCP localport=%d", *port, *port, *port, *port, *turnPort, *turnPort)
 	log.Println("   WebRTC 画面走随机 UDP 端口，还需允许浏览器（chrome.exe）通过防火墙（设置 → 防火墙 → 允许应用通过）")
 	if turnURL != "" {
 		log.Printf("   TURN 中继(远程 UDP 被丢时的 TCP 兜底): %s", turnURL)
@@ -217,12 +214,58 @@ func main() {
 	log.Println("==============================================")
 
 	log.Printf("服务运行中: https://[::]:%d", *port)
+	ensureFirewallRules(*port, *turnPort)
 	go func() {
 		if err := srv.ServeTLS(ln, "", ""); err != nil {
 			log.Printf("HTTP 服务异常: %v", err)
 		}
 	}()
 	runTray(*port) // 系统托盘（阻塞；X 关闭控制台 → 隐藏驻留托盘，托盘「退出」才结束进程）
+}
+
+// runHiddenCmd 执行 cmd /c 命令且不弹出控制台窗口（netsh/start 等后台命令用）
+func runHiddenCmd(args ...string) *exec.Cmd {
+	c := exec.Command("cmd", append([]string{"/c"}, args...)...)
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	return c
+}
+
+// ensureFirewallRules 尽力自动放行入站（跨网络观看媒体链路必需；需管理员权限，失败明确提示手动命令）。
+// 覆盖：程序规则（本 exe 全端口，WebRTC 随机 UDP + 自定义 -port 一次解决）、服务端口 TCP/UDP、TURN 控制面 TCP。
+// 同步执行（删除/添加逐个等待完成），避免旧同名规则未删完导致 add 失败。
+func ensureFirewallRules(svcPort, turnPort int) {
+	// 规则已存在（安装版/管理员已运行过）→ 跳过，避免普通运行时反复尝试 netsh 刷屏
+	if out, err := runHiddenCmd(`netsh advfirewall firewall show rule name="TeaShare-app"`).Output(); err == nil && strings.Contains(string(out), "TeaShare-app") {
+		log.Println("防火墙规则已配置（TeaShare-app 存在），无需重复放行")
+		return
+	}
+	type rule struct{ name, prot, lp string }
+	rules := []rule{
+		{fmt.Sprintf("TeaShare-%d", svcPort), "TCP", fmt.Sprint(svcPort)},
+		{fmt.Sprintf("TeaShare-%d-UDP", svcPort), "UDP", fmt.Sprint(svcPort)},
+		{"TeaShare-turn-3478", "TCP", fmt.Sprint(turnPort)},
+	}
+	if exe, err := os.Executable(); err == nil {
+		delApp := fmt.Sprintf(`netsh advfirewall firewall delete rule name="TeaShare-app"`)
+		runHiddenCmd(delApp).Output() // 等待删除完成
+		addApp := fmt.Sprintf(`netsh advfirewall firewall add rule name="TeaShare-app" dir=in action=allow program="%s" enable=yes profile=any`, exe)
+		if _, err := runHiddenCmd(addApp).Output(); err != nil {
+			log.Printf("防火墙程序规则添加失败（请以管理员运行）: %v", err)
+		} else {
+			log.Println("防火墙规则已生效：TeaShare-app（程序全端口入站放行）")
+		}
+	}
+	for _, r := range rules {
+		del := fmt.Sprintf(`netsh advfirewall firewall delete rule name="%s"`, r.name)
+		runHiddenCmd(del).Output() // 等待删除完成，避免 add 同名冲突
+		add := fmt.Sprintf(`netsh advfirewall firewall add rule name="%s" dir=in action=allow protocol=%s localport=%s`, r.name, r.prot, r.lp)
+		if _, err := runHiddenCmd(add).Output(); err != nil {
+			log.Printf("防火墙规则 %s 添加失败（请以管理员运行）: %v", r.name, err)
+		} else {
+			log.Printf("防火墙规则已生效：%s（%s %s）", r.name, r.prot, r.lp)
+		}
+	}
+	log.Println("防火墙放行已自动尝试；若未生效请以管理员身份运行程序一次，或手动执行上述 netsh 命令")
 }
 
 // ---------- IPv6 探测 ----------
@@ -566,6 +609,7 @@ func (g *ipv6RelayGen) Validate() error {
 }
 
 func (g *ipv6RelayGen) AllocatePacketConn(_ string, requestedPort int) (net.PacketConn, net.Addr, error) {
+	// 中继端口使用系统随机（requestedPort=0）：程序规则 TeaShare-app 已放行本 exe 全端口入站
 	conn, err := net.ListenPacket("udp", fmt.Sprintf("[%s]:%d", g.relayIP, requestedPort))
 	if err != nil {
 		return nil, nil, err
@@ -660,18 +704,7 @@ type hub struct {
 	chatFiles  map[string]*chatFile // 聊天文件缓存（内存，重启清空，过期清理）
 	chatTotalB int                  // 聊天文件总字节（超上限时清理最旧）
 
-	// 多主机互联（二期）：mesh 全互联，任意主机连接另一主机即自动互联
-	nodeId        string                      // 本节点随机 id
-	serverStart   int64                       // 服务器启动时间戳（unix ms，前端刷新判断用）
-	nodes         map[string]*nodeLink        // 邻居节点 id -> 连接
-	topo          map[string][]string         // 全局拓扑：节点 id -> 邻居 id 列表（含本节点，mesh 全同步）
-	linkRtt       map[string]map[string]int64 // 节点间延迟矩阵：节点 id -> 其各邻居直连延迟（近似计算用）
-	joinTokens    map[string]time.Time        // 一次性 join token（/node-ws 校验）
-	forwardTokens map[string]string           // 再互联凭证（token -> 绑定的邻居节点 id，mesh 自动扩展用）
-	fileRoute     map[string]string           // 跨节点 fileId -> 源节点 id（下载代理路由）
-	fileBuf       map[string][]byte           // 跨节点文件分片组装缓冲
-	fileWait      map[string][]chan *chatFile
-	linkPending   map[string]bool // 连接中（防并发重复建立）
+	serverStart int64 // 服务器启动时间戳（unix ms，前端刷新判断用）
 
 	// 远程控制会话（P2-2）：targetOwnerID -> 控制权
 	ctrlMu     sync.Mutex
@@ -722,7 +755,7 @@ type peer struct {
 	host      bool   // 服务器主机（本机运行的浏览器，标记"服务器主机"徽章）
 	ip        string // 连接来源 IP（RemoteAddr，供观看端展示）
 	enterHost string // 进入页面的 URL 主机（前端 location.hostname 上报，供观看端展示服务地址）
-	hostId    string // 所属节点的服务运行者 peer id（多节点互联：该用户所在节点的服务用户）
+	hostId    string // 服务运行者 peer id（本服务器上的服务用户）
 	joinedAt  int64  // 加入时刻（Unix 毫秒；供前端在线时长徽章，peer.mu 保护）
 	rttMs     int64  // 该用户到其所在主机的延迟（服务器 ping 测量，peer.mu 保护）
 	lastPong  int64  // 最近一次收到 pong 的时间戳（死连接探测，peer.mu 保护）
@@ -764,26 +797,15 @@ func buildICEServers(turnURL, user, pass string) []webrtc.ICEServer {
 
 func newHub() *hub {
 	h := &hub{
-		peers:         make(map[string]*peer),
-		clientIDs:     make(map[string]*peer),
-		nodes:         make(map[string]*nodeLink),
-		topo:          make(map[string][]string),
-		linkRtt:       make(map[string]map[string]int64),
-		joinTokens:    make(map[string]time.Time),
-		forwardTokens: make(map[string]string),
-		fileRoute:     make(map[string]string),
-		fileBuf:       make(map[string][]byte),
-		fileWait:      make(map[string][]chan *chatFile),
-		linkPending:   make(map[string]bool),
-		ctrlReqs:      make(map[string]*ctrlReq),
-		ctrlActive:    make(map[string]*ctrlReq),
-		logSubs:       make(map[string]bool),
+		peers:      make(map[string]*peer),
+		clientIDs:  make(map[string]*peer),
+		ctrlReqs:   make(map[string]*ctrlReq),
+		ctrlActive: make(map[string]*ctrlReq),
+		logSubs:    make(map[string]bool),
 	}
 	h.sfu = &SFU{hub: h, streams: make(map[string]*stream), viewers: make(map[string]*viewerConn)}
 	h.chatFiles = make(map[string]*chatFile)
-	h.nodeId = randomToken(4)
 	h.serverStart = time.Now().UnixMilli()
-	log.Printf("node: 本节点 id = %s", h.nodeId)
 	return h
 }
 
@@ -803,6 +825,18 @@ var upgrader = websocket.Upgrader{
 
 var hostAddrsOnce sync.Once
 var hostAddrs []string
+
+// myHostName 本机服务运行者昵称（host 浏览器用户；无则空串，前端默认"主机"）
+func (h *hub) myHostName() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, p := range h.peers {
+		if p.conn != nil && p.host {
+			return p.name
+		}
+	}
+	return ""
+}
 
 // isHostConn 判断连接来源是否本机（服务器主机：loopback 或本服务监听地址）
 func isHostConn(r *http.Request) bool {
@@ -828,6 +862,76 @@ func isHostConn(r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// GET/POST /api/log-level：查询/切换日志调试模式（仅本机，运行时生效无需重启）
+func (h *hub) handleLogLevel(w http.ResponseWriter, r *http.Request) {
+	if !isHostConn(r) {
+		http.Error(w, "仅本机可操作", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodPost {
+		var body struct {
+			Verbose bool `json:"verbose"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		verboseFlag.Store(body.Verbose)
+		log.Printf("日志模式切换为: %v", body.Verbose)
+	}
+	json.NewEncoder(w).Encode(map[string]any{"verbose": verboseFlag.Load()})
+}
+
+// ---------- 延迟探测（卡片"与主机的延迟"） ----------
+
+// rttProbe 周期测量各用户到其主机的延迟：服务器主动 ping 本地浏览器（卡片右上角角标）
+func (h *hub) rttProbe() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now().UnixMilli()
+		h.mu.Lock()
+		local := make([]*peer, 0, len(h.peers))
+		for _, p := range h.peers {
+			if p.conn != nil {
+				local = append(local, p)
+			}
+		}
+		h.mu.Unlock()
+		for _, p := range local {
+			sendMsg(p, map[string]any{"type": "ping", "t": now})
+		}
+		// 死连接探测：连续 20s 无 pong 的浏览器连接主动断开（触发其本地立即重连），
+		// 避免半死连接挂到系统 TCP 超时——服务进程消失/手机网络半断场景
+		nowMs := time.Now().UnixMilli()
+		for _, p := range local {
+			p.mu.Lock()
+			dead := nowMs-p.lastPong > 20000 && p.lastPong > 0
+			age := nowMs - p.lastPong
+			p.mu.Unlock()
+			if dead {
+				log.Printf("peer: %s(%s) 心跳超时（%dms 无响应），主动断开", p.id, p.name, age)
+				p.conn.Close() // 触发 readLoop 退出 -> unregister 清理
+			}
+		}
+		// 用户延迟广播（卡片右上角角标）
+		h.mu.Lock()
+		rtts := make(map[string]any, len(h.peers))
+		for id, p := range h.peers {
+			p.mu.Lock()
+			r := p.rttMs
+			p.mu.Unlock()
+			if r > 0 {
+				rtts[id] = r
+			}
+		}
+		h.mu.Unlock()
+		if len(rtts) > 0 {
+			h.broadcast(map[string]any{"type": "peer-rtts", "rtts": rtts})
+		}
+	}
 }
 
 // clientIP 提取连接来源 IP（去端口）
@@ -1380,34 +1484,6 @@ func (p *peer) handleHello(m map[string]any) {
 	if len(hist) > 0 {
 		sendMsg(p, map[string]any{"type": "chat-history", "messages": hist})
 	}
-	h.broadcastTopo()          // 本节点子用户变化（拓扑图刷新）
-	h.forwardPeerAddToNodes(p) // 跨节点同步：本节点用户加入/改名，通知所有邻居
-}
-
-// forwardPeerAddToNodes 向所有邻居广播本节点用户的加入/更新（node-peer-add）
-func (h *hub) forwardPeerAddToNodes(p *peer) {
-	h.mu.Lock()
-	links := make([]*nodeLink, 0, len(h.nodes))
-	for _, nl := range h.nodes {
-		links = append(links, nl)
-	}
-	h.mu.Unlock()
-	for _, nl := range links {
-		nl.sendMsg(map[string]any{"type": "node-peer-add", "peer": h.peerInfo(p)})
-	}
-}
-
-// forwardPeerRemoveToNodes 向所有邻居广播本节点用户的离开（node-peer-remove）
-func (h *hub) forwardPeerRemoveToNodes(id string) {
-	h.mu.Lock()
-	links := make([]*nodeLink, 0, len(h.nodes))
-	for _, nl := range h.nodes {
-		links = append(links, nl)
-	}
-	h.mu.Unlock()
-	for _, nl := range links {
-		nl.sendMsg(map[string]any{"type": "node-peer-remove", "id": id})
-	}
 }
 
 func (p *peer) handlePublishOffer(m map[string]any) {
@@ -1692,7 +1768,6 @@ func (h *hub) onStreamAudio(ownerID string, remote *webrtc.TrackRemote, sourcePC
 	}
 	// 通知已订阅观看者补加音频
 	s.ensureAllSubscribers()
-	h.nodeStreamAdded(st)
 	logV("publish: %s 音频到达 kind=%s codec=%s", ownerID, kind, remote.Codec().MimeType)
 }
 
@@ -1747,7 +1822,6 @@ func (h *hub) onStreamLayer(ownerID string, remote *webrtc.TrackRemote, rid stri
 	}
 	// 每次层到达都补订：覆盖"流条目存在但层未就绪时观看者被跳过"的竞态（首次页面/刷新时黑屏隐患）
 	s.ensureAllSubscribers()
-	h.nodeStreamAdded(st)
 	return isNew
 }
 
@@ -1819,9 +1893,6 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 		if id == viewerID || strings.HasPrefix(id, viewerID+"-") {
 			continue // 不订阅自己（含自己的子流：主视频/摄像头/音频）
 		}
-		if _, ok := vc.senders[id]; ok {
-			continue
-		}
 		local := st.Layers["l"] // 默认档位：流畅（省带宽、更稳定）
 		if local == nil {
 			for _, l := range st.Layers {
@@ -1836,6 +1907,16 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 			log.Printf("subscribe: %s 流 %s 层未就绪", viewerID, id)
 			continue // 层尚未到达
 		}
+		if old, ok := vc.senders[id]; ok {
+			// 同流层替换（编码切换/重开共享后代理流重建）：轨对象已变化 → 换新轨，避免收旧 SSRC 黑屏
+			if old.Track() == local {
+				continue
+			}
+			vc.pc.RemoveTrack(old) //nolint:errcheck
+			old.Stop()
+			delete(vc.senders, id)
+			delete(vc.tiers, id)
+		}
 		sender, err := vc.pc.AddTrack(local)
 		if err != nil {
 			log.Printf("subscribe: AddTrack 失败 viewer=%s stream=%s: %v", viewerID, id, err)
@@ -1848,8 +1929,13 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 		logV("subscribe: %s 已订阅流 %s", viewerID, id)
 		// 音频：随视频一起订阅全部通道（无 PLI）
 		for kind, al := range st.AudioTracks {
-			if _, ok := vc.audioSender[id+"-"+kind]; ok {
-				continue
+			if aOld, ok := vc.audioSender[id+"-"+kind]; ok {
+				if aOld.Track() == al {
+					continue
+				}
+				vc.pc.RemoveTrack(aOld) //nolint:errcheck
+				aOld.Stop()
+				delete(vc.audioSender, id+"-"+kind)
 			}
 			aSender, err := vc.pc.AddTrack(al)
 			if err != nil {
@@ -1874,8 +1960,13 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 			}
 		}
 		for kind, al := range st.AudioTracks {
-			if _, ok := vc.audioSender[id+"-"+kind]; ok {
-				continue
+			if aOld, ok := vc.audioSender[id+"-"+kind]; ok {
+				if aOld.Track() == al {
+					continue
+				}
+				vc.pc.RemoveTrack(aOld) //nolint:errcheck
+				aOld.Stop()
+				delete(vc.audioSender, id+"-"+kind)
 			}
 			aSender, err := vc.pc.AddTrack(al)
 			if err != nil {
@@ -1897,7 +1988,6 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 			}
 		}
 	}
-	s.hub.syncSubscribeToNeighbors() // 按需转发：本地观看者数量变化通知邻居
 }
 
 func (s *SFU) ensureAllSubscribers() {
@@ -2132,20 +2222,6 @@ func (p *peer) handleShareConfig(m map[string]any) {
 		"frameRate": cfg["frameRate"], "bitrate": cfg["bitrate"],
 		"width": cfg["width"], "height": cfg["height"],
 	})
-	h.forwardShareConfigToNodes(p.id, cfg)
-}
-
-// forwardShareConfigToNodes 把编码配置转发给邻居（远端清晰度判定用）
-func (h *hub) forwardShareConfigToNodes(ownerID string, cfg map[string]any) {
-	h.mu.Lock()
-	links := make([]*nodeLink, 0, len(h.nodes))
-	for _, nl := range h.nodes {
-		links = append(links, nl)
-	}
-	h.mu.Unlock()
-	for _, nl := range links {
-		nl.sendMsg(map[string]any{"type": "node-share-config", "ownerId": ownerID, "config": cfg})
-	}
 }
 
 func (p *peer) handleViewerConfig(m map[string]any) {
@@ -2222,7 +2298,6 @@ func (p *peer) handleChat(m map[string]any) {
 		"fileId": fileId, "fileName": fileName, "fileType": fileType,
 	}
 	h.appendChat(msg)
-	h.forwardChatToNodes(msg)
 }
 
 // appendChat 本地广播 + 写入聊天历史（含历史截断与文件缓存清理）
@@ -2255,19 +2330,6 @@ func (h *hub) appendChat(msg map[string]any) {
 	}
 	h.mu.Unlock()
 	h.broadcast(msg) // 含发送者：前端统一渲染，不做本地回显
-}
-
-// forwardChatToNodes 把聊天消息转发给所有邻居节点（跨节点互通）
-func (h *hub) forwardChatToNodes(msg map[string]any) {
-	h.mu.Lock()
-	links := make([]*nodeLink, 0, len(h.nodes))
-	for _, nl := range h.nodes {
-		links = append(links, nl)
-	}
-	h.mu.Unlock()
-	for _, nl := range links {
-		nl.sendMsg(map[string]any{"type": "node-chat", "msg": msg})
-	}
 }
 
 // ---------- 聊天文件（内存缓存，重启清空，60 分钟过期清理） ----------
@@ -2350,15 +2412,6 @@ func (h *hub) handleChatFileGet(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	cf := h.chatFiles[id]
 	h.mu.Unlock()
-	if cf == nil {
-		// 本节点无缓存：尝试从源节点跨节点拉取
-		h.mu.Lock()
-		src := h.fileRoute[id]
-		h.mu.Unlock()
-		if src != "" {
-			cf = h.fetchRemoteFile(id, src)
-		}
-	}
 	if cf == nil {
 		http.Error(w, "文件不存在或已过期", http.StatusNotFound)
 		return
@@ -2523,9 +2576,6 @@ func (s *SFU) removeAudioStreamAll(ownerID string) {
 	}
 	s.hub.broadcast(map[string]any{"type": "stream-removed", "id": streamID, "ownerId": ownerID})
 	s.broadcastWatchers(ownerID)
-	if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
-		s.hub.nodeStreamRemoved(ownerID, "all")
-	}
 }
 
 // removeStreamVideo 移除共享者的视频流（屏幕共享停止；音频为独立流，不受影响）。
@@ -2563,14 +2613,6 @@ func (s *SFU) removeStreamVideo(ownerID string, sourcePC *webrtc.PeerConnection)
 	}
 	s.hub.broadcast(map[string]any{"type": "stream-removed", "id": ownerID, "ownerId": ownerID})
 	s.broadcastWatchers(ownerID)
-	if !s.hub.isProxyStream(st) { // 代理流移除不转发（源节点自行管理，防回环）
-		h := s.hub
-		if strings.HasSuffix(ownerID, "-cam") {
-			h.nodeStreamRemoved(strings.TrimSuffix(ownerID, "-cam"), "cam")
-		} else {
-			h.nodeStreamRemoved(ownerID, "video")
-		}
-	}
 	log.Printf("removeStreamVideo: %s 视频流移除（音频独立流保留）", ownerID)
 }
 
@@ -2612,9 +2654,6 @@ func (s *SFU) removeStreamAudio(ownerID string, kind string) {
 		}
 		s.hub.broadcast(map[string]any{"type": "stream-removed", "id": streamID, "ownerId": ownerID})
 		s.broadcastWatchers(ownerID)
-		if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
-			s.hub.nodeStreamRemoved(ownerID, kind)
-		}
 		return
 	}
 	// 有剩余通道：仅移除该通道
@@ -2633,9 +2672,6 @@ func (s *SFU) removeStreamAudio(ownerID string, kind string) {
 		vc.negotiate()
 	}
 	s.hub.broadcast(map[string]any{"type": "stream-audio-removed", "id": streamID, "ownerId": ownerID, "kind": kind})
-	if !s.hub.isProxyStream(st) { // 代理流移除不转发（防回环）
-		s.hub.nodeStreamRemoved(ownerID, kind)
-	}
 }
 
 func (s *SFU) removeViewer(viewerID string) {
@@ -2652,7 +2688,6 @@ func (s *SFU) removeViewer(viewerID string) {
 		for _, id := range subscribed {
 			s.broadcastWatchers(id)
 		}
-		s.hub.syncSubscribeToNeighbors() // 按需转发：本地观看者数量变化通知邻居
 		return
 	}
 	s.mu.Unlock()
@@ -2710,12 +2745,10 @@ func (h *hub) unregister(p *peer) {
 	h.sfu.removeAllStreams(p.id)
 	h.sfu.removeViewer(p.id)
 	h.broadcast(map[string]any{"type": "peer-left", "id": p.id})
-	h.broadcastTopo()                // 本节点子用户变化（拓扑图刷新）
-	h.forwardPeerRemoveToNodes(p.id) // 跨节点同步：本节点用户离开
 }
 
 func sendMsg(p *peer, m map[string]any) {
-	if p == nil || p.conn == nil { // 虚拟 peer（远端节点用户）不走浏览器通道
+	if p == nil || p.conn == nil { // 无连接通道的 peer 不走浏览器发送
 		return
 	}
 	data, err := json.Marshal(m)

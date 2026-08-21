@@ -39,9 +39,13 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Run]
-; 防火墙规则（TCP/UDP 7553）：先删后加，保证规则存在且正确
+; 防火墙规则（TCP/UDP 7553 + TURN 3478 + 中继 UDP 段 + 程序全端口）：先删后加，保证规则存在且正确
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TeaShare-7553"""; Flags: runhidden
 Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""TeaShare-7553"" dir=in action=allow protocol=TCP localport=7553"; Flags: runhidden
 Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TeaShare-7553-UDP"""; Flags: runhidden
 Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""TeaShare-7553-UDP"" dir=in action=allow protocol=UDP localport=7553"; Flags: runhidden
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TeaShare-turn-3478"""; Flags: runhidden
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""TeaShare-turn-3478"" dir=in action=allow protocol=TCP localport=3478"; Flags: runhidden
+Filename: "netsh.exe"; Parameters: "advfirewall firewall delete rule name=""TeaShare-app"""; Flags: runhidden
+Filename: "netsh.exe"; Parameters: "advfirewall firewall add rule name=""TeaShare-app"" dir=in action=allow program=""{app}\{#MyAppExeName}"" enable=yes profile=any"; Flags: runhidden
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 TeaRTC 屏幕共享"; Flags: nowait postinstall skipifsilent

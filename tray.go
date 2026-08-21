@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"github.com/getlantern/systray"
 )
@@ -77,7 +78,9 @@ func runTray(port int) {
 	})
 }
 
-// openBrowser 用默认浏览器打开 URL（Windows cmd start）
+// openBrowser 用默认浏览器打开 URL（Windows cmd start，隐藏控制台窗口）
 func openBrowser(url string) {
-	_ = exec.Command("cmd", "/c", "start", "", url).Start()
+	c := exec.Command("cmd", "/c", "start", "", url)
+	c.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = c.Start()
 }
