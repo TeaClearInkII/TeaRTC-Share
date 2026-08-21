@@ -237,12 +237,12 @@
   }
   #hostLostBanner[hidden] { display: none; }
   #hostLostBanner .hostBtns { display: flex; gap: 8px; flex-wrap: wrap; }
-  #verBanner {
+  #verBanner, #updBanner {
     max-width: 1400px; margin: 0 auto 10px;
     background: #1e3a8a; color: #bfdbfe; padding: 8px 14px; border-radius: 10px;
-    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
   }
-  #verBanner[hidden] { display: none; }
+  #verBanner[hidden], #updBanner[hidden] { display: none; }
   #proxyBanner {
     max-width: 1400px; margin: 0 auto 10px;
     background: #1e3a8a; color: #bfdbfe; padding: 8px 14px; border-radius: 10px;
@@ -367,8 +367,33 @@
 </div>
 
 <div id="verBanner" hidden>
-  <span>检测到新版本，建议<b>刷新页面</b>以获得最新功能</span>
+  <span>检测到服务器已重启，建议<b>刷新页面</b>以获得最新功能</span>
   <button class="btn mini" id="verRefresh">刷新页面</button>
+</div>
+
+<div id="updBanner" hidden>
+  <span>发现新版本 <b id="updBannerVer">v0.0.0</b></span>
+  <span class="hostBtns">
+    <button class="btn mini" id="updBannerView">查看下载</button>
+    <button class="btn mini" id="updBannerClose">关闭</button>
+  </span>
+</div>
+
+<div id="updModal" class="modal" hidden>
+  <div class="modalBox" style="min-width:min(420px,92vw)">
+    <div class="modalHead"><span>下载新版本 <b id="updModalVer">v0.0.0</b></span><button class="btn mini" id="updClose">×</button></div>
+    <div class="aboutBody">
+      <div class="netItem"><span class="netDot" style="background:#24292e"></span><b>GitHub Releases</b>
+        <a class="btn mini" id="updGithub" href="#" target="_blank" rel="noopener">打开</a></div>
+      <div class="netItem"><span class="netDot" style="background:#fb7299"></span><b>蓝奏云</b><span style="font-size:11px;color:#8fa3c4">访问密码 TeaTea</span>
+        <a class="btn mini" href="https://wwaul.lanzout.com/b00g4f9iva" target="_blank" rel="noopener">打开</a></div>
+      <div class="netItem"><span class="netDot" style="background:#2a9d8f"></span><b>123 云盘</b>
+        <a class="btn mini" href="https://1818650178.share.123pan.cn/123pan/gjihjv-9vTwd" target="_blank" rel="noopener">打开</a></div>
+      <div class="netItem"><span class="netDot" style="background:#457b9d"></span><b>夸克网盘</b>
+        <a class="btn mini" href="https://pan.quark.cn/s/0fc6a68aea08" target="_blank" rel="noopener">打开</a></div>
+      <p class="hint" style="font-size:11px;color:#8fa3c4;margin-top:6px">任选其一下载；绿色版解压即用，安装版自动配置防火墙。</p>
+    </div>
+  </div>
 </div>
 
 <div id="proxyBanner" hidden>
@@ -469,7 +494,7 @@
         <a class="btn primary mini bili" href="https://space.bilibili.com/388428308" target="_blank" rel="noopener">哔哩哔哩</a>
         <a class="btn primary mini gh" href="https://github.com/TeaClearInkII/TeaRTC-Share" target="_blank" rel="noopener">GitHub</a>
       </div>
-      <div class="aboutRow"><span>版本</span><b id="aboutVer">-</b></div>
+      <div class="aboutRow"><span>版本</span><b id="aboutVer">-</b><span id="aboutUpd" style="font-size:11px;color:#8fa3c4"></span><button class="btn mini" id="aboutCheckUpd">检查更新</button></div>
       <div class="aboutRow"><span>服务器启动时间</span><span id="aboutStart">-</span></div>
       <div class="aboutRow"><span>服务器已运行</span><span id="aboutUptime">-</span></div>
       <div class="aboutRow"><span>页面已打开</span><span id="aboutPageUp">-</span></div>
@@ -709,7 +734,7 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.3.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.3.1'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
@@ -798,6 +823,13 @@ async function init() {
     } catch (e) {}
   };
   $('logClear').onclick = () => { $('logBody').textContent = ''; logAcc = 0; };
+  // 检查更新：横幅 / 下载弹窗 / 关于弹窗按钮
+  $('updBannerView').onclick = () => openUpdModal();
+  $('updBannerClose').onclick = () => { $('updBanner').hidden = true; };
+  $('updClose').onclick = () => { $('updModal').hidden = true; };
+  $('updModal').addEventListener('click', e => { if (e.target === $('updModal')) $('updModal').hidden = true; });
+  $('aboutCheckUpd').onclick = () => checkUpdate(true);
+  setTimeout(checkUpdate, 3000); // 页面加载后延迟检查（不阻塞首屏；24h 缓存内不重复请求）
   // 提示音开关（关于弹窗）
   $('aboutSound').checked = soundOn();
   $('aboutSound').addEventListener('change', e => {
@@ -2464,6 +2496,66 @@ function setRttBadge(el, rtt) {
   el.style.color = rtt <= 50 ? '#4ade80' : (rtt <= 150 ? '#fbbf24' : '#f87171');
 }
 
+// 版本比较：a 比 b 新返回正数（忽略 v 前缀，按数字段比较）
+function verCmp(a, b) {
+  const pa = String(a || '').replace(/^v/i, '').split('.').map(Number);
+  const pb = String(b || '').replace(/^v/i, '').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const x = pa[i] || 0, y = pb[i] || 0;
+    if (x !== y) return x - y;
+  }
+  return 0;
+}
+
+// 检查更新：GitHub Releases API；24h 缓存（避免限流），网络不通/失败静默
+const UPD_CHECK_KEY = 'teashare_upd_check';
+let latestVer = '';
+let latestUrl = '';
+async function checkUpdate(force) {
+  const verEl = $('aboutUpd');
+  if (verEl) verEl.textContent = force ? '检查中…' : '';
+  if (!force) {
+    try {
+      const c = JSON.parse(localStorage.getItem(UPD_CHECK_KEY) || 'null');
+      if (c && Date.now() - c.at < 24 * 3600000) { applyUpdateInfo(c.tag, c.url); return; }
+    } catch (e) {}
+  }
+  try {
+    const r = await fetch('https://api.github.com/repos/TeaClearInkII/TeaRTC-Share/releases/latest', { cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const j = await r.json();
+    const tag = String(j.tag_name || '').replace(/^v/i, '');
+    if (!tag) throw new Error('no tag');
+    localStorage.setItem(UPD_CHECK_KEY, JSON.stringify({ at: Date.now(), tag, url: j.html_url || '' }));
+    applyUpdateInfo(tag, j.html_url || '');
+    if (verEl) verEl.textContent = '';
+  } catch (e) {
+    if (verEl) verEl.textContent = '（无法连接 GitHub，可手动访问仓库查看）';
+  }
+}
+
+function applyUpdateInfo(tag, url) {
+  latestVer = tag;
+  latestUrl = url;
+  if (verCmp(tag, appVer) > 0) {
+    $('updBannerVer').textContent = 'v' + tag;
+    $('updBanner').hidden = false;
+  } else if (verCmp(tag, appVer) === 0) {
+    // 已是最新：仅在关于弹窗提示，不弹横幅
+  }
+  const verEl = $('aboutUpd');
+  if (verEl && !$('aboutModal').hidden) {
+    verEl.textContent = verCmp(tag, appVer) > 0 ? `发现新版本 v${tag} →` : '（已是最新版本）';
+  }
+}
+
+function openUpdModal() {
+  $('updModalVer').textContent = 'v' + (latestVer || '');
+  if (latestUrl) $('updGithub').href = latestUrl;
+  else $('updGithub').href = 'https://github.com/TeaClearInkII/TeaRTC-Share/releases/latest';
+  $('updModal').hidden = false;
+}
+
 // 关于弹窗：版本/服务器启动与运行时长/页面时长/缓存时间/日志模式/刷新状态
 function fmtDurMs(ms) {
   if (!ms || ms <= 0) return '-';
@@ -2477,6 +2569,11 @@ function fmtDurMs(ms) {
 
 function renderAbout() {
   $('aboutVer').textContent = appVer;
+  const updEl = $('aboutUpd');
+  if (updEl) {
+    if (latestVer) updEl.textContent = verCmp(latestVer, appVer) > 0 ? `发现新版本 v${latestVer} →` : '（已是最新版本）';
+    else updEl.textContent = '';
+  }
   $('aboutStart').textContent = serverStart ? new Date(serverStart).toLocaleString() : '-';
   const wsOpen = ws && ws.readyState === WebSocket.OPEN;
   // 服务器已运行：仅连接正常时计算（断开时不再虚增，重连后 refreshServerState 更新 serverStart 恢复准确）
