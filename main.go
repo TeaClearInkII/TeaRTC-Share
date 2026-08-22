@@ -840,6 +840,12 @@ func (h *hub) myHostName() string {
 
 // isHostConn 判断连接来源是否本机（服务器主机：loopback 或本服务监听地址）
 func isHostConn(r *http.Request) bool {
+	// 穿透隧道（樱花/ngrok 等）把远程访问者转发到本地，连接源为回环但会带代理头
+	//（X-Forwarded-For / X-Real-IP）——此时是远程浏览者而非本机用户：
+	// 否则会误标「服务器主机」徽章，且 /api/log-level 等本机接口被穿透访问误放行
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("X-Real-IP") != "" {
+		return false
+	}
 	host := r.RemoteAddr
 	if host == "" {
 		return false
@@ -1555,6 +1561,12 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 				{RTPCodingParameters: webrtc.RTPCodingParameters{RID: "h"}},
 			},
 		})
+	} else if audioKind != "" {
+		// 音频通道同样预置接收 transceiver（对齐视频路径）：无预置时 pion 自动创建的
+		// 传输启动行为与预置不一致，曾导致音频 ICE 卡 checking→failed（视频正常、音频失败）
+		pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{ //nolint:errcheck
+			Direction: webrtc.RTPTransceiverDirectionRecvonly,
+		})
 	}
 	p.mu.Lock()
 	if audioKind != "" {
@@ -1586,6 +1598,10 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 	pc.OnICEConnectionStateChange(func(s webrtc.ICEConnectionState) {
 		if pcType == "camera" {
 			log.Printf("camera: %s ICE 状态=%s", p.id, s) // 诊断：摄像头推流连接状态
+		} else if audioKind != "" {
+			log.Printf("audio-%s: %s ICE 状态=%s", audioKind, p.id, s) // 诊断：音频推流连接状态
+		} else {
+			log.Printf("publish: %s ICE 状态=%s", p.id, s) // 诊断：屏幕推流连接状态（对比音频用）
 		}
 		if s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed || s == webrtc.ICEConnectionStateDisconnected {
 			if audioKind != "" {
@@ -1601,6 +1617,7 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 		if c == nil {
 			return
 		}
+		logV("publish: %s 候选 %s %s:%d pc=%s", p.id, c.Typ.String(), c.Address, c.Port, pcType) // 诊断：候选是否发出
 		sendMsg(p, map[string]any{"type": "candidate", "pc": pcType, "candidate": c.ToJSON()})
 	})
 
@@ -2166,14 +2183,18 @@ func (p *peer) handleCandidate(m map[string]any) {
 		pc := p.pubPC
 		p.mu.Unlock()
 		if pc != nil {
-			pc.AddICECandidate(c) //nolint:errcheck
+			if err := pc.AddICECandidate(c); err != nil {
+				logV("publish: %s 候选 add 失败: %v", p.id, err)
+			}
 		}
 	case "camera":
 		p.mu.Lock()
 		pc := p.camPC
 		p.mu.Unlock()
 		if pc != nil {
-			pc.AddICECandidate(c) //nolint:errcheck
+			if err := pc.AddICECandidate(c); err != nil {
+				logV("publish: %s 候选 add 失败: %v", p.id, err)
+			}
 		}
 	case "audio", "audio-mic", "audio-system":
 		kind := "audio"
@@ -2186,7 +2207,9 @@ func (p *peer) handleCandidate(m map[string]any) {
 		pc := p.audioPubPCs[kind]
 		p.mu.Unlock()
 		if pc != nil {
-			pc.AddICECandidate(c) //nolint:errcheck
+			if err := pc.AddICECandidate(c); err != nil {
+				logV("publish: %s 候选 add 失败 pc=%s: %v", p.id, pcType, err)
+			}
 		}
 	case "subscribe":
 		vc := p.hub.sfu.viewers[p.id]

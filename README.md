@@ -49,12 +49,12 @@
 ### 场景一：主机没有 IPv6（关于弹窗显示"无"）
 需要**共享者（运行服务的一方）**开启 IPv6：
 1. 按 `Win + R`，输入 `powershell` 回车
-2. 右键粘贴命令，回车：`netsh interface ipv6 enable`（需管理员运行；多数系统默认已启用，此命令仅在禁用时生效）
+2. 右键粘贴命令，回车：`Enable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`（需管理员运行；多数系统默认已启用，此命令仅在禁用时生效）
 3. 重新打开 <https://testipv6.cn/> 确认检测通过
 
 ### 场景二：主机有 IPv6，但对方进不来
 需要**观看者**开启 IPv6（IPv6 端到端，双方缺一不可）：
-1. 同样在电脑上运行：`netsh interface ipv6 enable`（管理员），或确认已启用
+1. 同样在电脑上运行：`Enable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6`（管理员），或确认已启用
 2. 手机端：手机流量一般默认支持；使用 WiFi 时需在路由器设置中开启 IPv6
 3. 用浏览器打开 `https://[IPv6地址]:7553` 访问（IPv6 地址需加方括号）
 

@@ -734,7 +734,7 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.3.1'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.3.2'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
@@ -1227,7 +1227,7 @@ function onMessage(m) {
         : (m.pc === 'camera' ? camPC
         : (m.pc === 'audio-mic' ? audioPubPCs.mic
         : (m.pc === 'audio-system' ? audioPubPCs.system : subPC)));
-      if (cpc) cpc.addIceCandidate(new RTCIceCandidate(m.candidate)).catch(() => {});
+      if (cpc) cpc.addIceCandidate(new RTCIceCandidate(m.candidate)).catch(e => console.debug('候选 add 失败 pc=' + m.pc, e)); // 诊断
       break;
     case 'pong':
       if (typeof m.t === 'number') { wsRtt = Date.now() - m.t; lastPongT = Date.now(); } // 心跳存活刷新
@@ -1463,7 +1463,9 @@ function updateMyHostLine() {
     const h = [...peers.values()].find(p => p.host); // 本节点服务运行者
     hostTxt = h ? h.name : myAddr; // 无 → 服务器 IP（页面所在服务）
   }
-  el.textContent = `我的 IP：${myIp || '-'} - 主机：${hostTxt}`;
+  // 穿透域名访问：来源 IP 为本地转发（无意义），显示进入的域名
+  const myEh = isDomainHost(location.host) ? `穿透域名（${location.host}）` : (myIp || '-');
+  el.textContent = `我的 IP：${myEh} - 主机：${hostTxt}`;
 }
 
 // 上报编码配置（供接收端按发送端目标帧率判断解码受限）
@@ -1646,6 +1648,7 @@ async function rebuildAudioChain(kind) {
   const sr = audioSettings[kind].quality === 'voice' ? 32000 : undefined;
   const chain = buildAudioChain(kind, rawStream, sr);
   if (chainBuildSeq[kind] !== seq) { chain.ctx.close().catch(() => {}); return; } // 已被更新重建，作废
+  if (chain.ctx.state === 'suspended') chain.ctx.resume().catch(() => {}); // 重建后激活（手势/已有激活态）
   audioChains[kind] = chain;
   setSendVol(kind, audioSettings[kind].volume);
   applySendTopology(kind, audioSettings[kind].quality === 'standard');
@@ -1738,6 +1741,17 @@ async function toggleAudioShare(kind) {
   audioTracks[kind].onended = () => stopAudioShare(kind); // 浏览器原生停止共享（标签页音频）时自动复位
   // Web Audio 处理链：无损默认（仅降噪+增益）；标准档接入智能均衡+软膝
   const chain = buildAudioChain(kind, rawStream, audioSettings[kind].quality === 'voice' ? 32000 : undefined);
+  // 显式激活音频引擎：异步 getUserMedia 可能超出浏览器手势激活窗口，ctx 停在 suspended 时
+  // 处理链静默无输出 → 音频轨无数据 → ICE 无流量被判定断开（二次共享失败的根因）
+  try {
+    if (chain.ctx.state === 'suspended') await chain.ctx.resume();
+  } catch (e) {}
+  if (chain.ctx.state === 'suspended') {
+    state.textContent = '音频引擎未激活，请再点一次开启';
+    chain.ctx.close().catch(() => {});
+    rawStream.getTracks().forEach(t => t.stop());
+    return;
+  }
   audioChains[kind] = chain;
   setSendVol(kind, audioSettings[kind].volume);
   applySendTopology(kind, audioSettings[kind].quality === 'standard');
@@ -1746,10 +1760,16 @@ async function toggleAudioShare(kind) {
   const stream = chain.dest.stream; // 推流处理后的流
   const pc = new RTCPeerConnection({ iceServers });
   pc.onicecandidate = e => {
-    if (e.candidate) send({ type: 'candidate', pc: 'audio-' + kind, candidate: e.candidate.toJSON() });
+    if (e.candidate) {
+      console.debug('audio ' + kind + ' 候选发出:', e.candidate.type, e.candidate.address, e.candidate.port); // 诊断
+      send({ type: 'candidate', pc: 'audio-' + kind, candidate: e.candidate.toJSON() });
+    }
   };
   pc.onconnectionstatechange = () => {
-    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) stopAudioShare(kind);
+    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      flashMsg(`音频连接断开（${pc.connectionState}），已停止共享`); // 诊断：二次共享失败/10s 停止时可见原因
+      stopAudioShare(kind);
+    }
   };
   pc.addTrack(stream.getAudioTracks()[0], stream);
   audioPubPCs[kind] = pc;
@@ -2336,14 +2356,17 @@ const ICON_FILE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_ARROW_DOWN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
 
 // 控制条 HTML（画质下拉 + 三个观看方式图标；音量控制不在画面上，位于卡片下方）
-function controlsHTML(streamId) {
+function controlsHTML(streamId, canCtl) {
   const pipBtn = document.pictureInPictureEnabled && !isMobile()
     ? `<button class="ctrl" data-watch="pip" data-stream="${streamId}" title="画中画">${ICON_PIP}</button>` : '';
+  // 远程控制仅支持控制服务器运行者（host）的屏幕：非 host 卡片不显示申请控制按钮
+  const ctlBtn = canCtl
+    ? `<button class="ctrl ctlBtn" data-ctl="${streamId}" title="远程控制（需对方同意；仅支持控制服务器运行者的屏幕）">${ICON_CTL}</button>` : '';
   return `<div class="controls">
     <select class="tierSel" data-stream="${streamId}" title="画质">
       <option value="l">流畅</option><option value="m">高清</option><option value="h">超清</option>
     </select>
-    <button class="ctrl ctlBtn" data-ctl="${streamId}" title="远程控制（需对方同意；仅支持控制服务器运行者的屏幕）">${ICON_CTL}</button>
+    ${ctlBtn}
     <button class="ctrl" data-watch="cinema" data-stream="${streamId}" title="网页全屏">${ICON_CINEMA}</button>
     <button class="ctrl" data-watch="fullscreen" data-stream="${streamId}" title="全屏">${ICON_FULLSCREEN}</button>
     ${pipBtn}
@@ -3078,13 +3101,13 @@ function rebuildGrid() {
         ${pill}${hostPill}
       </div>
       <span class="rttBadge" id="rtt-${id}">${info.rtt ? info.rtt + 'ms' : '—'}</span>
-      ${sharing ? `<div class="videoWrap"><video autoplay playsinline muted></video><div class="camStats" data-vstats-bar="${id}" title="点击查看详细统计"><span data-vstats="${id}"></span><span data-vdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id)}</div>` : ''}
-      ${camSharing ? `<div class="camWrap"><video data-cam="${id}" autoplay playsinline muted></video><div class="camStats" data-camstats-bar="${id}" title="点击查看详细统计"><span data-camstats="${id}"></span><span data-cdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id + '-cam')}</div>` : ''}
+      ${sharing ? `<div class="videoWrap"><video autoplay playsinline muted></video><div class="camStats" data-vstats-bar="${id}" title="点击查看详细统计"><span data-vstats="${id}"></span><span data-vdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id, !!info.host)}</div>` : ''}
+      ${camSharing ? `<div class="camWrap"><video data-cam="${id}" autoplay playsinline muted></video><div class="camStats" data-camstats-bar="${id}" title="点击查看详细统计"><span data-camstats="${id}"></span><span data-cdetail="${id}">${ICON_INFO} 详细</span></div>${controlsHTML(id + '-cam', !!info.host)}</div>` : ''}
       ${hasAudioStream ? `
         <div class="audioBar" data-audio-bar="${id}"></div>` : ''}
       <div class="pbody">
         ${(myIsHost && myStream) ? `<div class="inviteRow"><button class="btn mini" data-invite-card="${id}">邀请控制</button></div>` : ''}
-        <p class="stats">对方 IP：${info.ip && !isDomainHost(info.enterHost) ? info.ip : (isDomainHost(info.enterHost) ? '穿透域名访问' : (info.ip || '-'))} - 主机：${hostPeer ? hostPeer.name : (info.enterHost || addrList[0] || '-')}</p>
+        <p class="stats">对方 IP：${info.ip && !isDomainHost(info.enterHost) ? info.ip : (isDomainHost(info.enterHost) ? `穿透域名（${escapeHtml(info.enterHost)}）` : (info.ip || '-'))} - 主机：${hostPeer ? hostPeer.name : (info.enterHost || addrList[0] || '-')}</p>
         <dl class="kv" id="detail-${id}" hidden></dl>
         ${camSharing ? `<dl class="kv" id="detail-${id}-cam" hidden></dl>` : ''}
       </div>`;
@@ -3175,7 +3198,8 @@ function openCinema(streamId) {
   focused = streamId; // 仅用于影院视频同步，不改变档位
   // 影院内控制条（画质 + 全屏/画中画/旋转切换；音量在卡片音频通道条控制）
   const box = $('cinemaControls');
-  box.innerHTML = controlsHTML(streamId);
+  const ctlOwner = peers.get(streamId.replace(/-cam$/, '')) || {}; // 流属主（cam 流去后缀）
+  box.innerHTML = controlsHTML(streamId, !!ctlOwner.host);
   box.querySelector('.tierSel').value = manualTier.get(streamId) || 'l';
   box.querySelector('.tierSel').onchange = e => setTier(streamId, e.target.value);
   box.querySelectorAll('.ctrl').forEach(b => {
@@ -3684,7 +3708,7 @@ const IPV6_TEST_LINKS = [
 function renderIpv6Hint(hintEl, copyRow, copyBtn, visitUrl) {
   const v6 = ipv6Info || {};
   const v6Has = v6.localAddrs && v6.localAddrs.length;
-  const ipv6Cmd = 'netsh interface ipv6 enable';
+  const ipv6Cmd = 'Enable-NetAdapterBinding -Name "*" -ComponentID ms_tcpip6';
   const testTxt = '检测 IPv6 是否可用：\r\n' + IPV6_TEST_LINKS.join('\r\n');
   const url = visitUrl || location.origin;
   if (v6Has) {
