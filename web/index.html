@@ -504,6 +504,7 @@
       <div class="aboutRow"><span>主机 IPv6 出站</span><span id="aboutIpv6Route">-</span></div>
       <div class="aboutRow"><span>主机公网 IPv6</span><span id="aboutIpv6Public">-</span></div>
       <div class="aboutRow"><span>主机公网 IPv4</span><span id="aboutIpv6Public4">-</span></div>
+      <div class="aboutRow" style="font-size:11px;color:#6b7c99"><span>公网可达为出站检测，不保证对方能访问本机（入站需防火墙/运营商放行）</span></div>
       <div class="aboutRow" id="aboutIpv6Hint" style="margin-top:4px"></div>
       <div class="aboutRow" id="aboutIpv6CopyRow" hidden><button class="btn mini" id="aboutIpv6CopyBtn"></button></div>
       <div class="aboutRow" style="font-size:11px;color:#9fb3d1"><span>IPv6 检测网站：</span><a href="https://testipv6.cn/" target="_blank" rel="noopener">testipv6.cn</a><span>、</span><a href="https://www.bj-ipv6.com/z/" target="_blank" rel="noopener">bj-ipv6.com</a></div>
@@ -716,6 +717,7 @@ const uaStr = navigator.userAgent;
 const isIOS = /iPhone|iPad|iPod/i.test(uaStr) || (navigator.maxTouchPoints > 0 && /Macintosh/i.test(uaStr) && /Safari/i.test(uaStr) && !/Chrome|Edg/i.test(uaStr));
 const isMobileDevice = isIOS || /Android/i.test(uaStr);
 let pubPC = null, subPC = null;
+const pubIceRetry = {}; // pcType(publish/camera/audio-mic/audio-system) -> ICE failed 自动重试次数
 let myStream = null, myTrack = null;
 let myStreamStart = 0, myCamStart = 0; const myAudioStart = { mic: 0, system: 0 }; // 自己各共享会话开始时间（徽章时长）
 let iceServers = [], addrList = [], port = 7553;
@@ -734,7 +736,7 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.3.2'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.3.3'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
@@ -786,6 +788,7 @@ async function init() {
   $('btnAbout').innerHTML = ICON_INFO;
   $('btnAbout').onclick = () => {
     $('aboutModal').hidden = false;
+    startIpv6Refresh(); // 周期静默刷新主机网络检测数据（服务器后台检测完成后界面自动更新）
     fetch('/api/log-level').then(r => r.json()).then(j => { aboutVerbose = !!j.verbose; renderAbout(); }).catch(() => renderAbout());
   };
   $('aboutClose').onclick = () => { $('aboutModal').hidden = true; stopAboutTimer(); };
@@ -1766,9 +1769,24 @@ async function toggleAudioShare(kind) {
     }
   };
   pc.onconnectionstatechange = () => {
-    if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
-      flashMsg(`音频连接断开（${pc.connectionState}），已停止共享`); // 诊断：二次共享失败/10s 停止时可见原因
-      stopAudioShare(kind);
+    // 实时推送状态 + 网络抖动容错：disconnected 容忍（可能恢复）；failed 自动重试（最多 2 次）
+    const st = pc.connectionState;
+    const key = 'audio-' + kind;
+    const stEl = document.getElementById(kind === 'mic' ? 'micState' : 'sysState');
+    const base = kind === 'mic' ? '麦克风共享中' : '音频共享中';
+    if (st === 'connected') { if (stEl) { stEl.textContent = base + '（推送正常）'; stEl.style.color = ''; } }
+    else if (st === 'checking') { if (stEl) { stEl.textContent = base + '（连接中…）'; stEl.style.color = '#fbbf24'; } }
+    else if (st === 'disconnected') { if (stEl) { stEl.textContent = base + '（网络波动，恢复中…）'; stEl.style.color = '#fbbf24'; } }
+    else if (st === 'failed') {
+      const n = pubIceRetry[key] || 0;
+      if (n < 2) {
+        pubIceRetry[key] = n + 1;
+        if (stEl) { stEl.textContent = `连接失败，自动重连（${n + 1}/2）…`; stEl.style.color = '#fbbf24'; }
+        pc.restartIce().catch(() => {});
+      } else {
+        flashMsg(`音频连接断开（failed），已停止共享`);
+        stopAudioShare(kind);
+      }
     }
   };
   pc.addTrack(stream.getAudioTracks()[0], stream);
@@ -1785,7 +1803,9 @@ async function toggleAudioShare(kind) {
   btn.innerHTML = ICON_STOP; // 共享中：停止图标
   btn.classList.add('iconbtn', 'active');
   btn.classList.remove('idle');
-  state.textContent = kind === 'system' ? '音频共享中' : '麦克风共享中';
+  state.textContent = kind === 'system' ? '音频共享中（连接中…）' : '麦克风共享中（连接中…）';
+  state.style.color = '#fbbf24';
+  pubIceRetry['audio-' + kind] = 0; // 重置 ICE 自动重试计数
   if (kind === 'mic') loadMicSources();
 }
 
@@ -2016,13 +2036,13 @@ function appendChatMsg(m, skipUnread) {
     const isImg = /^image\//.test(m.fileType || '');
     const isVideo = /^video\//.test(m.fileType || '');
     if (isImg) {
-      // 图片：加载失败（文件已过期/被清理）→ 显示过期占位
-      body.push(`<img class="chatImg" src="/api/chat-file/${m.fileId}" alt="图片" onclick="window.open('/api/chat-file/${m.fileId}','_blank')" onerror="this.outerHTML='<span class=\'chatExpired\'>（图片已过期）</span>'">`);
+      // 图片：加载失败（文件已过期/网络失败）→ 模糊占位（onerror 无法区分）
+      body.push(`<img class="chatImg" src="/api/chat-file/${m.fileId}" alt="图片" onclick="window.open('/api/chat-file/${m.fileId}','_blank')" onerror="this.outerHTML='<span class=\'chatExpired\'>（加载失败，可能已过期）</span>'">`);
     } else if (isVideo) {
-      // 视频：内联播放（服务器对 video/* 返回 inline）；加载失败 → 过期占位
-      body.push(`<video class="chatVideo" src="/api/chat-file/${m.fileId}" controls preload="metadata" onerror="this.outerHTML='<span class=\'chatExpired\'>（视频已过期）</span>'"></video>`);
+      // 视频：内联播放（服务器对 video/* 返回 inline）；加载失败 → 模糊占位
+      body.push(`<video class="chatVideo" src="/api/chat-file/${m.fileId}" controls preload="metadata" onerror="this.outerHTML='<span class=\'chatExpired\'>（加载失败，可能已过期）</span>'"></video>`);
     } else {
-      // 文件：异步检测是否仍可用，404 → 过期占位
+      // 文件：异步检测是否仍可用——404 → 已过期；网络失败 → 下载失败提示（区分，避免误报）
       const key = 'f' + m.fileId + '-' + (m.ts || Math.random());
       body.push(`<a class="chatFile" id="${key}" href="/api/chat-file/${m.fileId}" download="${escapeHtml(m.fileName || 'file')}">${ICON_FILE} ${escapeHtml(m.fileName || '文件')}</a>`);
       setTimeout(() => {
@@ -2030,7 +2050,7 @@ function appendChatMsg(m, skipUnread) {
         if (!a) return;
         fetch('/api/chat-file/' + m.fileId, { method: 'HEAD' })
           .then(r => { if (!r.ok && a) a.outerHTML = '<span class="chatExpired">（文件已过期）</span>'; })
-          .catch(() => { if (a) a.outerHTML = '<span class="chatExpired">（文件已过期）</span>'; });
+          .catch(() => { if (a) a.outerHTML = '<span class="chatExpired">（下载失败，网络问题请重试）</span>'; });
       }, 50);
     }
   }
@@ -2113,17 +2133,47 @@ function createPublishPC(track, cfg, pcType) {
   };
   if (pcType === 'publish') {
     pc.onconnectionstatechange = () => {
-      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
-        closePublish();
-        $('myStats').textContent = '推流连接中断';
+      // 实时推送状态：用户可直接看到共享是否成功推送
+      const st = pc.connectionState;
+      if (st === 'connected') { $('myStats').textContent = '推流中（推送正常）'; $('myStats').style.color = ''; }
+      else if (st === 'checking') { $('myStats').textContent = '推流中（连接中…）'; $('myStats').style.color = '#fbbf24'; }
+      else if (st === 'disconnected') { $('myStats').textContent = '推流中（网络波动，恢复中…）'; $('myStats').style.color = '#fbbf24'; }
+      else if (st === 'failed') {
+        // ICE 自动重试（最多 2 次）：跨网/抖动时换候选组合重建
+        const n = pubIceRetry[pcType] || 0;
+        if (n < 2) {
+          pubIceRetry[pcType] = n + 1;
+          $('myStats').textContent = `连接失败，自动重连（${n + 1}/2）…`;
+          $('myStats').style.color = '#fbbf24';
+          pc.restartIce().catch(() => {});
+        } else {
+          closePublish();
+          $('myStats').textContent = '已断开（网络不佳），请重新共享';
+          $('myStats').style.color = '#f87171';
+          flashMsg('网络不佳，屏幕共享已断开，请重新共享');
+        }
       }
     };
   } else {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected' && camRestarting) camRestarting = false;
-      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+      const st = pc.connectionState;
+      const camState = $('camState');
+      // 实时推送状态（摄像头）
+      if (st === 'connected') { camState.textContent = '摄像头共享中（推送正常）'; camState.style.color = ''; }
+      else if (st === 'checking') { camState.textContent = '摄像头共享中（连接中…）'; camState.style.color = '#fbbf24'; }
+      else if (st === 'disconnected') { camState.textContent = '摄像头共享中（网络波动，恢复中…）'; camState.style.color = '#fbbf24'; }
+      else if (st === 'failed') {
         if (camRestarting) { camRestartFail = true; return; } // 热切换失败：不清理状态，交由切换流程回滚
-        stopCameraShare();
+        const n = pubIceRetry[pcType] || 0;
+        if (n < 2) {
+          pubIceRetry[pcType] = n + 1;
+          camState.textContent = `连接失败，自动重连（${n + 1}/2）…`;
+          camState.style.color = '#fbbf24';
+          pc.restartIce().catch(() => {});
+        } else {
+          stopCameraShare();
+        }
       }
     };
   }
@@ -2154,6 +2204,7 @@ async function restartCamPublish() {
     camPC = null;
   }
   camPC = createPublishPC(camTrack, camCfg, 'camera');
+  pubIceRetry['camera'] = 0; // 重置 ICE 自动重试计数
   $('camState').textContent = '摄像头共享中';
   setTimeout(() => { camRestarting = false; }, 8000); // 连接观察期兜底
 }
@@ -2179,6 +2230,7 @@ function setupPublish(stream) {
   if (invBtn) invBtn.hidden = false; // host 共享屏幕中：显示邀请按钮
 
   pubPC = createPublishPC(myTrack, sharerCfg, 'publish');
+  pubIceRetry['publish'] = 0; // 重置 ICE 自动重试计数
   // 初始编码参数立即应用（degradationPreference=maintain-framerate 保帧率等）
   updateSenderParams().catch(() => {});
   sendShareConfig();
@@ -2291,6 +2343,7 @@ async function toggleCameraShare() {
   $('myCamVideo').srcObject = stream;
   $('myCamVideo').hidden = false;
   camPC = createPublishPC(camTrack, camCfg, 'camera');
+  pubIceRetry['camera'] = 0; // 重置 ICE 自动重试计数
   $('btnCam').innerHTML = ICON_STOP; // 共享中：停止图标
   $('btnCam').classList.remove('idle');
   $('btnCam').classList.add('active');
@@ -2615,7 +2668,7 @@ function renderAbout() {
   $('aboutIpv6Addrs').textContent = v6Addrs;
   $('aboutIpv6Route').innerHTML = v6.route ? '<span class="ok">可用（可出站）</span>' : '<span class="warn">不可用</span>';
   $('aboutIpv6Public').innerHTML = v6.public
-    ? `<span class="ok">可达</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
+    ? `<span class="ok">可达（出站检测）</span>（${escapeHtml(v6.publicIPv6 || '-')}）`
     : '<span class="warn">不可达</span>';
   $('aboutIpv6Public4').textContent = v6.publicIPv4 || '不可达';
   // IPv6 场景提示（与「分享观看地址」弹窗同一内容；访问地址取首个真实 IPv6，无则公网 IPv4）
@@ -2628,8 +2681,25 @@ function renderAbout() {
   if (!aboutTimer) aboutTimer = setInterval(renderAbout, 1000);
 }
 
+let ipv6RefreshTimer = null;
+// 周期性静默刷新主机网络检测数据（/addrs 的 ipv6）：服务器后台检测完成后界面自动更新
+function startIpv6Refresh() {
+  if (ipv6RefreshTimer) return;
+  ipv6RefreshTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/addrs');
+      const d = await r.json();
+      if (d.ipv6) {
+        ipv6Info = d.ipv6;
+        if (!$('aboutModal').hidden) renderAbout(); // 关于弹窗打开时刷新显示
+      }
+    } catch (e) {}
+  }, 60000);
+}
+
 function stopAboutTimer() {
   if (aboutTimer) { clearInterval(aboutTimer); aboutTimer = null; }
+  if (ipv6RefreshTimer) { clearInterval(ipv6RefreshTimer); ipv6RefreshTimer = null; }
 }
 
 function appendLogLine(line) {

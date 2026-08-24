@@ -1603,7 +1603,9 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 		} else {
 			log.Printf("publish: %s ICE 状态=%s", p.id, s) // 诊断：屏幕推流连接状态（对比音频用）
 		}
-		if s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed || s == webrtc.ICEConnectionStateDisconnected {
+		// 网络抖动容错：disconnected 是瞬时断流（可能自动恢复），不清理流；
+		// 仅 failed/closed 才移除（否则抖动恢复后流已被删，观看/共享中断）
+		if s == webrtc.ICEConnectionStateFailed || s == webrtc.ICEConnectionStateClosed {
 			if audioKind != "" {
 				h.sfu.removeStreamAudio(p.id, audioKind) // 音频通道断开：仅移除该通道（视频流可能仍在）
 			} else if pcType == "camera" {
