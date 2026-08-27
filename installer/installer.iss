@@ -1,8 +1,8 @@
 ; TeaRTC 屏幕共享 安装脚本（Inno Setup 6）
-; 版本号默认 0.1.0，构建脚本以 /DMyAppVersion= 传入（与 web/index.html 的 appVer 保持一致）
+; 版本号默认 0.4.0，构建脚本以 /DMyAppVersion= 传入（与 web/index.html 的 appVer 保持一致）
 #define MyAppName "TeaRTC 屏幕共享"
 #ifndef MyAppVersion
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.4.0"
 #endif
 #define MyAppExeName "TeaRTCShare.exe"
 

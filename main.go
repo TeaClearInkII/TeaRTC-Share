@@ -17,6 +17,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	mrand "math/rand"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -52,7 +53,7 @@ const (
 	caCN         = "TeaShare Local CA"
 	caValidDays  = 3650
 	srvValidDays = 365
-	appVersion   = "0.1.0"
+	appVersion   = "0.4.0"
 )
 
 var verboseFlag atomic.Bool // 日志调试模式（-v 启动或运行时 /api/log-level 切换）
@@ -147,7 +148,18 @@ func main() {
 	mux.HandleFunc("/api/log-level", h.handleLogLevel)
 	mux.HandleFunc("/api/chat-file", h.handleChatFileUpload)
 	mux.HandleFunc("/api/chat-file/", h.handleChatFileGet)
+	mux.HandleFunc("/api/chat-config", h.handleChatConfig)
 	mux.HandleFunc("/api/link-preview", h.handleLinkPreview)
+	mux.HandleFunc("/api/music/list", h.handleMusicList)
+	mux.HandleFunc("/api/music/add", h.handleMusicAdd)
+	mux.HandleFunc("/api/music/remove", h.handleMusicRemove)
+	mux.HandleFunc("/api/music/removePlaylist", h.handleMusicRemovePlaylist)
+	mux.HandleFunc("/api/music/refresh", h.handleMusicRefreshPlaylist)
+	mux.HandleFunc("/api/music/search", h.handleMusicSearch)
+	mux.HandleFunc("/api/music/preview", h.handleMusicPreview)
+	mux.HandleFunc("/api/music/cover", h.handleMusicCover)
+	mux.HandleFunc("/api/music/stream", h.handleMusicStream)
+	mux.HandleFunc("/api/music/lyric", h.handleMusicLyric)
 	mux.HandleFunc("/ca.crt", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-x509-ca-cert")
 		w.Header().Set("Content-Disposition", `attachment; filename="teashare-ca.crt"`)
@@ -700,9 +712,12 @@ type hub struct {
 	seq        int
 	streamCfgs map[string]map[string]any // streamId -> 共享者最新配置
 
-	chatHist   []map[string]any     // 聊天历史（最近 100 条，重启清空；新成员可见）
+	chatHist   []map[string]any     // 聊天历史（最近 N 条，重启清空；新成员可见）
 	chatFiles  map[string]*chatFile // 聊天文件缓存（内存，重启清空，过期清理）
-	chatTotalB int                  // 聊天文件总字节（超上限时清理最旧）
+	chatCfg    chatConfig           // 聊天配置（config/chat.json）
+	chatLogMu  sync.Mutex           // 聊天持久化日志写锁
+	chatLog    *os.File             // chat.jsonl 追加写（持久化开启时打开）
+	chatTotalB int64                // 聊天文件总字节（超上限时清理最旧）
 
 	serverStart int64 // 服务器启动时间戳（unix ms，前端刷新判断用）
 
@@ -715,6 +730,27 @@ type hub struct {
 	logBufMu sync.Mutex
 	logBuf   []string        // 最近日志（环形，上限 logBufMax）
 	logSubs  map[string]bool // peer id -> 已订阅（日志窗口打开中）
+
+	// 音乐播放器（共享听歌）：服务器为权威播放器，任何用户可控制；无人 30s 自动暂停
+	musicMu           sync.Mutex
+	musicList         []MusicItem       // 播放列表（持久化 config/music.json）
+	musicIndex        int               // 当前播放索引（-1 = 无）
+	musicScope        string            // 播放范围："all"（全部）/"single"（单曲与直链）/ 歌单 id
+	musicOrder        string            // 播放顺序："sequence"（顺序）/"shuffle"（随机）/"loop"（单曲循环）
+	musicPlay         bool              // 播放中
+	musicPos          float64           // 暂停时进度（秒）
+	musicAt           int64             // 开始播放时间戳（ms，进度 = musicPos + (now-musicAt)/1000）
+	musicNoPeer       time.Time         // 上次有连接的时间（无人判定）
+	musicCache        map[string][]byte // 流内存缓存（最近 musicCacheMax 首，防多用户重复拉网易云）
+	musicCacheOrder   []string          // 流缓存 LRU 顺序（url）
+	musicEnded        map[string]bool   // 直链曲目 ended 上报去重（URL -> 已上报）
+	musicURLRefreshed map[string]int64  // 曲目直链刷新时间戳（id -> ms，10 分钟节流）
+	musicHistory      []int             // 播放历史（最近 5 首的全局索引；随机模式"上一曲"用）
+	musicForward      []int             // 随机"上一曲"撤销栈（prev 记录回退前曲；next 撤销回）
+	musicShuffleQueue []int             // 随机播放洗牌队列（Fisher-Yates；播完重洗，保证不重复）
+	coverRefreshMu    sync.Mutex        // 封面失效刷新去重/节流
+	coverRefreshing   map[string]bool   // URL -> 刷新进行中（并发去重）
+	coverRefreshTried map[string]int64  // URL -> 上次刷新尝试时间戳（5 分钟节流，防反复请求网易云）
 }
 
 // ctrlReq 远程控制请求/会话
@@ -724,13 +760,25 @@ type ctrlReq struct {
 	at             time.Time
 }
 
-// chatFile 聊天上传的文件（内存缓存）
+// chatFile 聊天上传的文件（大文件落盘，小文件内存缓存）
 type chatFile struct {
-	data []byte
+	data []byte // 小文件内存数据（big 时为 nil，从磁盘读）
+	path string // 落盘路径（big 时有效）
 	mime string
 	name string
 	at   time.Time
 	big  bool // 大文件（> 阈值）：按时间过期清理；小文件随聊天历史上限清理
+}
+
+// chatConfig 聊天配置（config/chat.json；重启生效）
+type chatConfig struct {
+	HistKeep     int  `json:"histKeep"`     // 历史保留条数（内存+新成员补发）
+	FileTotal    int  `json:"fileTotal"`    // 文件总缓存上限 MB
+	FileExpire   int  `json:"fileExpire"`   // 大文件过期分钟
+	FileMax      int  `json:"fileMax"`      // 单文件上限 MB
+	BigThreshold int  `json:"bigThreshold"` // 大文件阈值 MB（大于此值落盘+过期清理）
+	MsgLimit     int  `json:"msgLimit"`     // 消息文本字符上限
+	Persist      bool `json:"persist"`      // 消息持久化开关
 }
 
 type SFU struct {
@@ -805,7 +853,17 @@ func newHub() *hub {
 	}
 	h.sfu = &SFU{hub: h, streams: make(map[string]*stream), viewers: make(map[string]*viewerConn)}
 	h.chatFiles = make(map[string]*chatFile)
+	h.loadChatConfig()
+	h.loadChatHist() // 从磁盘加载最近历史
+	h.musicIndex = -1
+	h.musicCache = make(map[string][]byte)
+	h.musicEnded = make(map[string]bool)
+	h.musicURLRefreshed = make(map[string]int64)
+	h.coverRefreshing = make(map[string]bool)
+	h.coverRefreshTried = make(map[string]int64)
 	h.serverStart = time.Now().UnixMilli()
+	h.loadMusicState()
+	go h.musicTicker()
 	return h
 }
 
@@ -1024,6 +1082,8 @@ func (p *peer) handle(m map[string]any) {
 		p.hub.sfu.resetSubscriber(p.id)
 	case "ctrl":
 		p.handleCtrl(m)
+	case "music-ctl":
+		p.hub.handleMusicCtl(m)
 	case "log-subscribe": // 打开日志窗口：开始接收服务器日志
 		p.hub.logSubscribe(p)
 	case "log-unsubscribe": // 关闭日志窗口
@@ -1037,6 +1097,643 @@ func (p *peer) handle(m map[string]any) {
 			p.mu.Unlock()
 		}
 	}
+}
+
+// ---- 音乐播放器（共享听歌）：服务器权威播放器，任何用户可控制 ----
+
+const musicCacheMax = 5 // 流内存缓存最近 5 首（防多用户重复拉网易云，重启清空）
+
+// musicTicker 1s 定时器：播放中进度超曲目时长自动切歌
+func (h *hub) musicTicker() {
+	ticker := time.NewTicker(time.Second)
+	for range ticker.C {
+		h.musicMu.Lock()
+		if h.musicPlay && h.musicIndex >= 0 && h.musicIndex < len(h.musicList) {
+			cur := h.musicList[h.musicIndex]
+			pos := h.musicPos + float64(time.Now().UnixMilli()-h.musicAt)/1000
+			if cur.Dur > 0 && pos >= float64(cur.Dur) {
+				h.musicMu.Unlock()
+				h.musicAutoNext()
+				continue
+			}
+		}
+		h.musicMu.Unlock()
+	}
+}
+
+// musicCtl 处理任意用户的控制消息（play/pause/next/prev/seek）
+func (h *hub) handleMusicCtl(m map[string]any) {
+	action, _ := m["action"].(string)
+	switch action {
+	case "play":
+		h.musicSetPlay(true)
+	case "pause":
+		h.musicSetPlay(false)
+	case "next":
+		h.musicNext()
+	case "prev":
+		h.musicPrev()
+	case "seek":
+		pos, _ := m["pos"].(float64)
+		if pos < 0 {
+			pos = 0
+		}
+		h.musicMu.Lock()
+		h.musicPos = pos
+		h.musicAt = time.Now().UnixMilli()
+		h.musicMu.Unlock()
+		h.musicBroadcast()
+	case "ended":
+		// 直链无时长：观众 audio ended 上报切歌（同曲目去重）
+		u, _ := m["url"].(string)
+		h.musicMu.Lock()
+		if h.musicPlay && h.musicIndex >= 0 && h.musicIndex < len(h.musicList) {
+			if h.musicList[h.musicIndex].URL == u && !h.musicEnded[u] {
+				h.musicEnded[u] = true
+				h.musicMu.Unlock()
+				h.musicAutoNext()
+				return
+			}
+		}
+		h.musicMu.Unlock()
+	case "add":
+		u, _ := m["url"].(string)
+		if u != "" {
+			go h.musicAdd(u)
+		}
+	case "remove":
+		idx, _ := m["index"].(float64)
+		h.musicRemove(int(idx))
+	case "scope":
+		// 切换播放范围：全部 / 单曲（single）/ 某歌单 id
+		scope, _ := m["scope"].(string)
+		h.musicSetScope(scope)
+	case "order":
+		// 切换播放顺序：sequence → shuffle → loop → sequence …
+		h.musicCycleOrder()
+	case "playAt":
+		// 点击播放指定歌曲（全局 index）
+		idx, _ := m["index"].(float64)
+		h.musicPlayAt(int(idx))
+	}
+}
+
+// musicScopeIndices 当前 scope 内曲目的全局索引列表（锁内调用；scope 无效回退 all）
+func (h *hub) musicScopeIndices() []int {
+	if h.musicScope == "all" {
+		var idx []int
+		seen := make(map[string]bool)
+		for i, it := range h.musicList {
+			k := dedupKey(it)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			idx = append(idx, i)
+		}
+		return idx
+	}
+	var idx []int
+	for i, it := range h.musicList {
+		if h.musicScope == "single" {
+			if it.PlaylistID == "" {
+				idx = append(idx, i)
+			}
+		} else if it.PlaylistID == h.musicScope {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+// musicSetScope 切换播放范围：当前曲目不在新 scope 则跳到新 scope 第一首（保持播放状态）
+func (h *hub) musicSetScope(scope string) {
+	if scope == "" {
+		scope = "all"
+	}
+	h.musicMu.Lock()
+	h.musicScope = scope
+	idx := h.musicScopeIndices()
+	if len(idx) == 0 {
+		h.musicScope = "all" // 空 scope 回退全部
+	}
+	h.musicShuffleQueue = nil // scope 变化：洗牌队列作废（下次随机重建）
+	// 切换歌单仅改变播放范围，不打断当前播放（当前曲目继续播，直到用户操作）
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicCycleOrder 循环切换播放顺序：sequence → shuffle → loop → sequence
+func (h *hub) musicCycleOrder() {
+	h.musicMu.Lock()
+	switch h.musicOrder {
+	case "sequence":
+		h.musicOrder = "shuffle"
+	case "shuffle":
+		h.musicOrder = "loop"
+	default:
+		h.musicOrder = "sequence"
+	}
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+func (h *hub) musicSetPlay(play bool) {
+	h.musicMu.Lock()
+	if play && h.musicIndex < 0 && len(h.musicList) > 0 {
+		// 取当前 scope 内第一首（而非无条件 index=0）
+		idx := h.musicScopeIndices()
+		if len(idx) > 0 {
+			h.musicIndex = idx[0]
+		} else {
+			h.musicIndex = 0
+		}
+	}
+	if play {
+		h.musicPlay = true
+		h.musicAt = time.Now().UnixMilli()
+		h.musicEnded = make(map[string]bool)
+	} else {
+		h.musicPlay = false
+		if h.musicIndex >= 0 {
+			h.musicPos += float64(time.Now().UnixMilli()-h.musicAt) / 1000
+		}
+	}
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicPlayAt 跳到指定 index 播放（点击列表曲目）
+func (h *hub) musicPlayAt(idx int) {
+	h.musicMu.Lock()
+	if idx < 0 || idx >= len(h.musicList) {
+		h.musicMu.Unlock()
+		return
+	}
+	oldIdx := h.musicIndex
+	if idx != oldIdx {
+		h.musicPushHistory(oldIdx) // 旧曲（已播过）入历史
+	}
+	h.musicForward = nil // 手动选曲：撤销栈作废
+	h.musicIndex = idx
+	h.musicPos = 0
+	h.musicAt = time.Now().UnixMilli()
+	h.musicPlay = true
+	h.musicEnded = make(map[string]bool)
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+func (h *hub) musicNext() {
+	h.musicMu.Lock()
+	oldIdx := h.musicIndex // 播过的旧曲（历史入栈，随机"上一曲"回退用）
+	idx := h.musicScopeIndices()
+	if len(idx) == 0 {
+		h.musicMu.Unlock()
+		return
+	}
+	if h.musicOrder == "shuffle" {
+		// 随机播放：优先撤销"上一曲"（回到回退前的歌）；否则随机选一首（排除当前）
+		if len(h.musicForward) > 0 {
+			h.musicIndex = h.musicForward[len(h.musicForward)-1]
+			h.musicForward = h.musicForward[:len(h.musicForward)-1]
+			h.musicPos = 0
+			h.musicAt = time.Now().UnixMilli()
+			h.musicPlay = true
+			h.musicEnded = make(map[string]bool)
+		} else if len(idx) == 1 {
+			h.musicPos = 0
+			h.musicAt = time.Now().UnixMilli()
+			h.musicPlay = true
+			h.musicEnded = make(map[string]bool)
+		} else {
+			// 洗牌队列随机（播完重洗；排除当前，保证全部播完前不重复）
+			h.musicIndex = h.popShuffle(h.musicIndex)
+			h.musicPos = 0
+			h.musicAt = time.Now().UnixMilli()
+			h.musicPlay = true
+			h.musicEnded = make(map[string]bool)
+		}
+	} else {
+		h.musicForward = nil // 顺序/循环切歌：撤销栈作废（新轨迹）
+		// 顺序播放（含单曲循环下手动切歌也切）：scope 内下一位
+		pos := -1
+		for i, gi := range idx {
+			if gi == h.musicIndex {
+				pos = i
+				break
+			}
+		}
+		// 去重后当前曲目不在 idx 中（重复项被去掉）→ 按去重键找真实位置
+		if pos == -1 {
+			curKey := dedupKey(h.musicList[h.musicIndex])
+			for i, gi := range idx {
+				if dedupKey(h.musicList[gi]) == curKey {
+					pos = i
+					break
+				}
+			}
+		}
+		if pos == -1 {
+			pos = 0
+		}
+		h.musicIndex = idx[(pos+1)%len(idx)]
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+		h.musicPlay = true
+		h.musicEnded = make(map[string]bool)
+	}
+	h.musicPushHistory(oldIdx) // 旧曲（已播过）入历史
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicAutoNext 自动切歌（播完超时/ended 上报）：单曲循环时重播当前，其余同手动切歌
+func (h *hub) musicAutoNext() {
+	h.musicMu.Lock()
+	if h.musicOrder == "loop" && h.musicIndex >= 0 && h.musicIndex < len(h.musicList) {
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+		h.musicPlay = true
+		h.musicEnded = make(map[string]bool)
+		h.musicMu.Unlock()
+		h.musicBroadcast()
+		return
+	}
+	h.musicMu.Unlock()
+	h.musicNext()
+}
+
+// musicPushHistory 播放历史入栈（去重相邻 + 上限 5；需持 musicMu）
+func (h *hub) musicPushHistory(idx int) {
+	if idx < 0 {
+		return
+	}
+	if len(h.musicHistory) > 0 && h.musicHistory[len(h.musicHistory)-1] == idx {
+		return // 相邻同曲不入
+	}
+	h.musicHistory = append(h.musicHistory, idx)
+	if len(h.musicHistory) > 5 {
+		h.musicHistory = h.musicHistory[len(h.musicHistory)-5:]
+	}
+}
+
+// rebuildShuffleQueue 重建随机播放洗牌队列（当前 scope 曲目 Fisher-Yates 洗牌；需持 musicMu）
+func (h *hub) rebuildShuffleQueue() {
+	idx := h.musicScopeIndices()
+	q := make([]int, len(idx))
+	copy(q, idx)
+	for i := len(q) - 1; i > 0; i-- { // Fisher-Yates
+		j := mrand.Intn(i + 1)
+		q[i], q[j] = q[j], q[i]
+	}
+	h.musicShuffleQueue = q
+}
+
+// popShuffle 取随机队列下一首（排除当前曲；队列耗尽自动重建；需持 musicMu）
+func (h *hub) popShuffle(cur int) int {
+	for len(h.musicShuffleQueue) > 0 {
+		last := len(h.musicShuffleQueue) - 1
+		v := h.musicShuffleQueue[last]
+		h.musicShuffleQueue = h.musicShuffleQueue[:last]
+		if v != cur {
+			return v
+		}
+	}
+	h.rebuildShuffleQueue()
+	if len(h.musicShuffleQueue) > 0 {
+		last := len(h.musicShuffleQueue) - 1
+		v := h.musicShuffleQueue[last]
+		h.musicShuffleQueue = h.musicShuffleQueue[:last]
+		return v
+	}
+	return cur
+}
+
+func (h *hub) musicPrev() {
+	h.musicMu.Lock()
+	// 随机播放："上一曲" = 历史上一曲（最近 5 首内回退）
+	if h.musicOrder == "shuffle" && len(h.musicHistory) > 0 {
+		prev := h.musicHistory[len(h.musicHistory)-1]
+		h.musicHistory = h.musicHistory[:len(h.musicHistory)-1]
+		h.musicForward = append(h.musicForward, h.musicIndex) // 记录回退前曲（next 可撤销回）
+		h.musicIndex = prev
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+		h.musicPlay = true
+		h.musicEnded = make(map[string]bool)
+		h.musicMu.Unlock()
+		h.musicBroadcast()
+		return
+	}
+	idx := h.musicScopeIndices()
+	if len(idx) == 0 {
+		h.musicMu.Unlock()
+		return
+	}
+	pos := -1
+	for i, gi := range idx {
+		if gi == h.musicIndex {
+			pos = i
+			break
+		}
+	}
+	// 去重后当前曲目不在 idx 中（重复项被去掉）→ 按去重键找真实位置
+	if pos == -1 {
+		curKey := dedupKey(h.musicList[h.musicIndex])
+		for i, gi := range idx {
+			if dedupKey(h.musicList[gi]) == curKey {
+				pos = i
+				break
+			}
+		}
+	}
+	if pos == -1 {
+		pos = 0
+	}
+	h.musicIndex = idx[(pos-1+len(idx))%len(idx)]
+	h.musicPos = 0
+	h.musicAt = time.Now().UnixMilli()
+	h.musicPlay = true
+	h.musicEnded = make(map[string]bool)
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicAdd 解析链接入列（异步，成功后广播列表）
+func (h *hub) musicAdd(u string) {
+	items, err := parseMusicURL(u)
+	if err != nil || len(items) == 0 {
+		return
+	}
+	// 提取 PlaylistID（歌单有；单曲/直链为空）
+	pid := ""
+	for _, it := range items {
+		if it.PlaylistID != "" {
+			pid = it.PlaylistID
+			break
+		}
+	}
+	if h.musicScope == "" {
+		h.musicScope = "all"
+	}
+	h.musicReplacePlaylist(pid, items)
+}
+
+func (h *hub) musicRemove(idx int) {
+	h.musicMu.Lock()
+	if idx < 0 || idx >= len(h.musicList) {
+		h.musicMu.Unlock()
+		return
+	}
+	h.musicList = append(h.musicList[:idx], h.musicList[idx+1:]...)
+	if len(h.musicList) == 0 {
+		h.musicIndex = -1
+		h.musicPlay = false
+	} else if h.musicIndex == idx {
+		h.musicIndex = idx % len(h.musicList)
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+	} else if h.musicIndex > idx {
+		h.musicIndex--
+	}
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicRemovePlaylist 移除整个歌单或单曲（scope = playlistId / "single"）
+func (h *hub) musicRemovePlaylist(scope string) {
+	h.musicMu.Lock()
+	if scope == "" {
+		h.musicMu.Unlock()
+		return
+	}
+	var kept []MusicItem
+	for _, it := range h.musicList {
+		if scope == "single" {
+			if it.PlaylistID == "" {
+				continue
+			}
+		} else if it.PlaylistID == scope {
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if len(kept) == len(h.musicList) {
+		h.musicMu.Unlock()
+		return
+	}
+	h.musicList = kept
+	if len(h.musicList) == 0 {
+		h.musicIndex = -1
+		h.musicPlay = false
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+		h.musicScope = "all"
+	} else if h.musicIndex >= len(h.musicList) {
+		h.musicIndex = len(h.musicList) - 1
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+	}
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicReplacePlaylist 替换歌单：删除旧曲 + 插入新曲（原位置）+ 修正 index/scope
+// pid 空 = 单曲追加（带 URL 去重）；pid 有 = 歌单替换
+func (h *hub) musicReplacePlaylist(pid string, items []MusicItem) {
+	h.musicMu.Lock()
+	if pid == "" {
+		// 单曲/直链：URL 去重后追加
+		seen := make(map[string]bool, len(h.musicList))
+		for _, it := range h.musicList {
+			if it.Source == "direct" {
+				seen[it.URL] = true
+			}
+		}
+		added := 0
+		for _, it := range items {
+			if it.Source == "direct" && seen[it.URL] {
+				continue
+			}
+			h.musicList = append(h.musicList, it)
+			added++
+		}
+		if added > 0 && h.musicIndex < 0 {
+			h.musicIndex = 0
+		}
+		h.saveMusicStateLocked()
+		h.musicMu.Unlock()
+		h.musicBroadcast()
+		return
+	}
+	// 歌单：找到旧曲起始位置，删除旧曲，在原位插入新曲
+	insertPos := -1
+	var kept []MusicItem
+	for i, it := range h.musicList {
+		if it.PlaylistID == pid {
+			if insertPos == -1 {
+				insertPos = i
+			}
+			continue
+		}
+		kept = append(kept, it)
+	}
+	if insertPos == -1 {
+		insertPos = len(kept)
+	}
+	// 拼接：前半 + 新曲 + 后半
+	final := make([]MusicItem, 0, len(kept)+len(items))
+	final = append(final, kept[:insertPos]...)
+	final = append(final, items...)
+	final = append(final, kept[insertPos:]...)
+	h.musicList = final
+	h.musicShuffleQueue = nil // 列表变化：洗牌队列作废（下次随机重建）
+	// 修正 musicIndex
+	if len(h.musicList) == 0 {
+		h.musicIndex = -1
+		h.musicPlay = false
+	} else if len(items) > 0 {
+		// 尝试保持当前曲目（按 ID 匹配新列表）
+		if h.musicIndex >= 0 && h.musicIndex < len(kept) {
+			curID := kept[h.musicIndex].ID
+			found := false
+			if curID != "" {
+				for i := insertPos; i < insertPos+len(items) && i < len(h.musicList); i++ {
+					if h.musicList[i].ID == curID {
+						h.musicIndex = i
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				h.musicIndex = insertPos
+			}
+		} else if h.musicIndex >= len(h.musicList) {
+			h.musicIndex = len(h.musicList) - 1
+		}
+		h.musicPos = 0
+		h.musicAt = time.Now().UnixMilli()
+	} else if h.musicIndex >= len(h.musicList) {
+		h.musicIndex = len(h.musicList) - 1
+	}
+	// 校验 scope
+	if h.musicScope != "all" && h.musicScope != "single" {
+		found := false
+		for _, it := range h.musicList {
+			if it.PlaylistID == h.musicScope {
+				found = true
+				break
+			}
+		}
+		if !found {
+			h.musicScope = "all"
+		}
+	}
+	h.saveMusicStateLocked()
+	h.musicMu.Unlock()
+	h.musicBroadcast()
+}
+
+// musicState 当前状态快照（锁外调用需自行持锁）
+func (h *hub) musicState() map[string]any {
+	h.musicMu.Lock()
+	defer h.musicMu.Unlock()
+	st := map[string]any{
+		"list": h.musicList, "index": h.musicIndex, "playing": h.musicPlay,
+		"pos": h.musicPos, "at": h.musicAt, "scope": h.musicScope, "order": h.musicOrder,
+	}
+	return st
+}
+
+// musicBroadcast 广播音乐状态（变化时/周期同步）；online = 当前在线浏览器用户数（一起听人数）
+func (h *hub) musicBroadcast() {
+	online := h.musicPeerCount()
+	h.broadcast(map[string]any{"type": "music-state", "state": h.musicState(), "online": online})
+}
+
+// musicPeerCount 当前在线浏览器用户数（无人判定）
+func (h *hub) musicPeerCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, p := range h.peers {
+		if p.conn != nil {
+			n++
+		}
+	}
+	return n
+}
+
+// musicNoPeerTick 连接变化时调用：无人（WS=0）30s 后自动暂停
+func (h *hub) musicNoPeerTick() {
+	if h.musicPeerCount() > 0 {
+		return
+	}
+	if h.musicNoPeer.IsZero() {
+		h.musicNoPeer = time.Now()
+		go func() {
+			time.Sleep(30 * time.Second)
+			h.musicMu.Lock()
+			again := h.musicPeerCount() == 0 && h.musicPlay
+			h.musicMu.Unlock()
+			if again {
+				h.musicSetPlay(false)
+				log.Printf("music: 房间无人 30s，自动暂停播放")
+			}
+		}()
+	} else if time.Since(h.musicNoPeer) > 30*time.Second {
+		h.musicNoPeer = time.Time{} // 有连接恢复：重置无人计时
+	}
+}
+
+// saveMusicStateLocked 持久化列表+状态（config/music.json；需已持 musicMu）
+func (h *hub) saveMusicStateLocked() {
+	data, err := json.Marshal(map[string]any{"list": h.musicList, "index": h.musicIndex, "pos": h.musicPos, "playing": h.musicPlay, "scope": h.musicScope, "order": h.musicOrder})
+	if err != nil {
+		return
+	}
+	_ = os.MkdirAll("config", 0o755)
+	_ = os.WriteFile("config/music.json", data, 0o600)
+}
+
+// loadMusicState 启动加载持久化状态
+func (h *hub) loadMusicState() {
+	data, err := os.ReadFile("config/music.json")
+	if err != nil {
+		return
+	}
+	var m struct {
+		List    []MusicItem `json:"list"`
+		Index   int         `json:"index"`
+		Pos     float64     `json:"pos"`
+		Playing bool        `json:"playing"`
+		Scope   string      `json:"scope"`
+		Order   string      `json:"order"`
+	}
+	if json.Unmarshal(data, &m) != nil {
+		return
+	}
+	h.musicMu.Lock()
+	h.musicList = m.List
+	h.musicIndex = m.Index
+	h.musicPos = m.Pos
+	h.musicScope = m.Scope
+	if h.musicScope == "" {
+		h.musicScope = "all"
+	}
+	h.musicOrder = m.Order
+	if h.musicOrder == "" {
+		h.musicOrder = "sequence"
+	}
+	h.musicPlay = false // 重启后不自动播放（等用户操作）
+	h.musicMu.Unlock()
 }
 
 // ---- 远程控制（P2-2）：仅支持控制"本机 host（服务器运行者）的屏幕"，被控端确认后单一控制者 ----
@@ -1490,6 +2187,8 @@ func (p *peer) handleHello(m map[string]any) {
 	if len(hist) > 0 {
 		sendMsg(p, map[string]any{"type": "chat-history", "messages": hist})
 	}
+	// 房间人数变化：广播 music-state 刷新"一起听"人数
+	h.musicBroadcast()
 }
 
 func (p *peer) handlePublishOffer(m map[string]any) {
@@ -1615,12 +2314,27 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 			}
 		}
 	})
+	// 候选发送顺序保证：answer 先发、候选后发——浏览器在 setRemoteDescription(answer)
+	// 之前 addIceCandidate 会失败且候选被丢弃，导致 ICE 无配对而 failed（曾因日志模式差异 100% 复现）
+	var (
+		candMu     sync.Mutex
+		pendCands  []webrtc.ICECandidateInit
+		answerSent bool
+	)
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
 		}
+		cj := c.ToJSON()
+		candMu.Lock()
+		if !answerSent {
+			pendCands = append(pendCands, cj)
+			candMu.Unlock()
+			return
+		}
+		candMu.Unlock()
 		logV("publish: %s 候选 %s %s:%d pc=%s", p.id, c.Typ.String(), c.Address, c.Port, pcType) // 诊断：候选是否发出
-		sendMsg(p, map[string]any{"type": "candidate", "pc": pcType, "candidate": c.ToJSON()})
+		sendMsg(p, map[string]any{"type": "candidate", "pc": pcType, "candidate": cj})
 	})
 
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: sdpStr}); err != nil {
@@ -1641,6 +2355,14 @@ func (p *peer) handlePublishOffer(m map[string]any) {
 	}
 	log.Printf("publish: %s 推流协商完成 (%s)", p.id, pcType)
 	sendMsg(p, map[string]any{"type": "publish-answer", "pc": pcType, "sdp": answer})
+	// answer 已发，刷新缓存的候选（保证浏览器先 setRemoteDescription 再 addIceCandidate）
+	candMu.Lock()
+	answerSent = true
+	for _, cj := range pendCands {
+		sendMsg(p, map[string]any{"type": "candidate", "pc": pcType, "candidate": cj})
+	}
+	pendCands = nil
+	candMu.Unlock()
 }
 
 // rewriteTrack 是自定义 TrackLocal：把转发 RTP 包的 SSRC 改写为
@@ -2302,6 +3024,88 @@ func (p *peer) handleViewerConfig(m map[string]any) {
 	vc.negotiate()
 }
 
+// loadChatConfig 加载聊天配置（config/chat.json；缺失用默认值）
+func (h *hub) loadChatConfig() {
+	h.chatCfg = chatConfig{HistKeep: 100, FileTotal: 200, FileExpire: 60, FileMax: 100, BigThreshold: 20, MsgLimit: 2000, Persist: true}
+	data, err := os.ReadFile("config/chat.json")
+	if err != nil {
+		return
+	}
+	json.Unmarshal(data, &h.chatCfg)
+	if h.chatCfg.HistKeep <= 0 {
+		h.chatCfg.HistKeep = 100
+	}
+	if h.chatCfg.FileTotal <= 0 {
+		h.chatCfg.FileTotal = 200
+	}
+	if h.chatCfg.FileExpire <= 0 {
+		h.chatCfg.FileExpire = 60
+	}
+	if h.chatCfg.FileMax <= 0 {
+		h.chatCfg.FileMax = 100
+	}
+	if h.chatCfg.BigThreshold <= 0 {
+		h.chatCfg.BigThreshold = 20
+	}
+	if h.chatCfg.MsgLimit <= 0 {
+		h.chatCfg.MsgLimit = 2000
+	}
+	// 持久化开启：打开 chat.jsonl 追加写
+	if h.chatCfg.Persist {
+		_ = os.MkdirAll("config", 0o755)
+		f, err := os.OpenFile("config/chat.jsonl", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err == nil {
+			h.chatLog = f
+		}
+	}
+}
+
+// saveChatConfig 保存聊天配置（config/chat.json）
+func (h *hub) saveChatConfig() error {
+	if err := os.MkdirAll("config", 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(h.chatCfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile("config/chat.json", data, 0o600)
+}
+
+// loadChatHist 启动时从 chat.jsonl 尾部加载最近 N 条（重启保留历史）
+func (h *hub) loadChatHist() {
+	data, err := os.ReadFile("config/chat.jsonl")
+	if err != nil {
+		return
+	}
+	keep := h.chatCfg.HistKeep
+	if keep <= 0 {
+		keep = 100
+	}
+	var lines [][]byte
+	start := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] == '\n' {
+			lines = append(lines, data[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(data) {
+		lines = append(lines, data[start:])
+	}
+	if len(lines) > keep {
+		lines = lines[len(lines)-keep:]
+	}
+	h.mu.Lock()
+	for _, ln := range lines {
+		var m map[string]any
+		if json.Unmarshal(ln, &m) == nil && m["type"] == "chat" {
+			h.chatHist = append(h.chatHist, m)
+		}
+	}
+	h.mu.Unlock()
+}
+
 func (p *peer) handleChat(m map[string]any) {
 	h := p.hub
 	text, _ := m["text"].(string)
@@ -2311,10 +3115,14 @@ func (p *peer) handleChat(m map[string]any) {
 	if text == "" && fileId == "" {
 		return
 	}
-	// 按字符数截断（2000 字符；[]rune 避免中文按字节截断导致显示少于 2000）
+	// 按字符数截断（配置上限；[]rune 避免中文按字节截断导致显示少于上限）
+	limit := h.chatCfg.MsgLimit
+	if limit <= 0 {
+		limit = 2000
+	}
 	runes := []rune(text)
-	if len(runes) > 2000 {
-		text = string(runes[:2000])
+	if len(runes) > limit {
+		text = string(runes[:limit])
 	}
 	msg := map[string]any{
 		"type": "chat",
@@ -2329,10 +3137,14 @@ func (p *peer) handleChat(m map[string]any) {
 func (h *hub) appendChat(msg map[string]any) {
 	h.mu.Lock()
 	h.chatHist = append(h.chatHist, msg)
-	if len(h.chatHist) > 100 {
+	keep := h.chatCfg.HistKeep
+	if keep <= 0 {
+		keep = 100
+	}
+	if len(h.chatHist) > keep {
 		// 超上限：截断最旧消息，并清理不再被历史引用的文件缓存（小文件随数量上限清理）
-		removed := h.chatHist[:len(h.chatHist)-100]
-		h.chatHist = h.chatHist[len(h.chatHist)-100:]
+		removed := h.chatHist[:len(h.chatHist)-keep]
+		h.chatHist = h.chatHist[len(h.chatHist)-keep:]
 		for _, rm := range removed {
 			fid, _ := rm["fileId"].(string)
 			if fid == "" {
@@ -2347,21 +3159,70 @@ func (h *hub) appendChat(msg map[string]any) {
 			}
 			if !stillUsed {
 				if cf, ok := h.chatFiles[fid]; ok {
-					h.chatTotalB -= len(cf.data)
+					h.chatTotalB -= int64(len(cf.data))
 				}
 				delete(h.chatFiles, fid)
 			}
 		}
+	}
+	// 持久化：追加写 chat.jsonl（磁盘历史）
+	if h.chatCfg.Persist {
+		h.chatLogMu.Lock()
+		line, err := json.Marshal(msg)
+		if err == nil {
+			h.chatLog.Write(append(line, '\n'))
+		}
+		h.chatLogMu.Unlock()
 	}
 	h.mu.Unlock()
 	h.broadcast(msg) // 含发送者：前端统一渲染，不做本地回显
 }
 
 // ---------- 聊天文件（内存缓存，重启清空，60 分钟过期清理） ----------
-
-const chatFileMaxSize = 100 << 20  // 单文件 100MB
-const chatBigFileSize = 20 << 20   // 大文件阈值：>20MB 按 60 分钟清理；≤20MB 随聊天历史上限清理
-const chatFileTotalMax = 200 << 20 // 总文件缓存上限 200MB：超限时新上传清理最旧文件
+const chatFileTotalMax = 200 << 20 // 默认总文件缓存上限（配置未设时兜底）
+// handleChatConfig GET/POST /api/chat-config：查询/保存聊天配置（仅 host；保存后重启生效）
+func (h *hub) handleChatConfig(w http.ResponseWriter, r *http.Request) {
+	if !isHostConn(r) {
+		http.Error(w, "仅主机可操作", http.StatusForbidden)
+		return
+	}
+	if r.Method == http.MethodPost {
+		var body chatConfig
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if body.HistKeep <= 0 || body.HistKeep > 500 {
+			body.HistKeep = 100
+		}
+		if body.FileTotal <= 0 || body.FileTotal > 1024 {
+			body.FileTotal = 200
+		}
+		if body.FileExpire <= 0 || body.FileExpire > 1440 {
+			body.FileExpire = 60
+		}
+		if body.FileMax <= 0 || body.FileMax > 200 {
+			body.FileMax = 100
+		}
+		if body.BigThreshold <= 0 || body.BigThreshold > 100 {
+			body.BigThreshold = 20
+		}
+		if body.MsgLimit < 500 || body.MsgLimit > 5000 {
+			body.MsgLimit = 2000
+		}
+		h.mu.Lock()
+		h.chatCfg = body
+		h.mu.Unlock()
+		if err := h.saveChatConfig(); err != nil {
+			http.Error(w, "保存失败", http.StatusInternalServerError)
+			return
+		}
+	}
+	h.mu.Lock()
+	cfg := h.chatCfg
+	h.mu.Unlock()
+	json.NewEncoder(w).Encode(cfg)
+}
 
 // handleChatFileUpload POST /api/chat-file：multipart 字段 file，返回 {id, mime, name}
 func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
@@ -2369,9 +3230,19 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, chatFileMaxSize+1<<20)
-	if err := r.ParseMultipartForm(chatFileMaxSize); err != nil {
-		http.Error(w, "文件过大或解析失败（≤20MB）", http.StatusBadRequest)
+	fileMax := h.chatCfg.FileMax
+	if fileMax <= 0 {
+		fileMax = 100
+	}
+	bigThr := h.chatCfg.BigThreshold
+	if bigThr <= 0 {
+		bigThr = 20
+	}
+	fileMaxB := int64(fileMax) << 20
+	bigThrB := int64(bigThr) << 20
+	r.Body = http.MaxBytesReader(w, r.Body, fileMaxB+1<<20)
+	if err := r.ParseMultipartForm(fileMaxB); err != nil {
+		http.Error(w, fmt.Sprintf("文件过大或解析失败（≤%dMB）", fileMax), http.StatusBadRequest)
 		return
 	}
 	file, header, err := r.FormFile("file")
@@ -2381,42 +3252,65 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 	data, err := io.ReadAll(file)
-	if err != nil || len(data) == 0 || len(data) > chatFileMaxSize {
-		http.Error(w, "文件读取失败或超过 20MB", http.StatusBadRequest)
+	if err != nil || len(data) == 0 || int64(len(data)) > fileMaxB {
+		http.Error(w, fmt.Sprintf("文件读取失败或超过 %dMB", fileMax), http.StatusBadRequest)
 		return
 	}
 	id := randomCred(8)
+	big := int64(len(data)) > bigThrB
+	cf := &chatFile{mime: header.Header.Get("Content-Type"), name: header.Filename, at: time.Now(), big: big}
+	// 大文件落盘（减少内存占用）；小文件内存缓存
+	if big {
+		if err := os.MkdirAll("config/chatfiles", 0o755); err == nil {
+			path := filepath.Join("config", "chatfiles", id)
+			if err := os.WriteFile(path, data, 0o600); err == nil {
+				cf.path = path
+				cf.data = nil // 释放内存
+			}
+		}
+	}
+	if cf.path == "" {
+		cf.data = data // 落盘失败或小文件：内存缓存
+	}
+	fileTotalMax := int64(h.chatCfg.FileTotal) << 20 // 配置总上限（MB）
+	if fileTotalMax <= 0 {
+		fileTotalMax = chatFileTotalMax
+	}
 	h.mu.Lock()
-	h.chatFiles[id] = &chatFile{data: data, mime: header.Header.Get("Content-Type"), name: header.Filename, at: time.Now(), big: len(data) > chatBigFileSize}
-	h.chatTotalB += len(data)
+	h.chatFiles[id] = cf
+	h.chatTotalB += int64(len(cf.data))
 	// 总缓存超上限：按最旧优先删除（保留新文件），直到放下
 	need := h.chatTotalB
-	if need > chatFileTotalMax {
+	if need > fileTotalMax {
 		type item struct {
 			id string
 			at time.Time
 		}
 		var items []item
-		for fid, cf := range h.chatFiles {
-			items = append(items, item{fid, cf.at})
+		for fid, c2 := range h.chatFiles {
+			items = append(items, item{fid, c2.at})
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i].at.Before(items[j].at) }) // 最旧在前
 		for _, it := range items {
 			if it.id == id {
 				continue // 保留新文件
 			}
-			sz := len(h.chatFiles[it.id].data)
+			del := h.chatFiles[it.id]
+			sz := int64(len(del.data))
 			delete(h.chatFiles, it.id)
 			h.chatTotalB -= sz
 			need -= sz
+			if del.path != "" {
+				os.Remove(del.path) // 删除磁盘文件
+			}
 			log.Printf("chat-file: 缓存超限，清理最旧 %s（%d 字节）", it.id, sz)
-			if need <= chatFileTotalMax {
+			if need <= fileTotalMax {
 				break
 			}
 		}
 	}
 	h.mu.Unlock()
-	log.Printf("chat-file: %s 上传 %s (%d 字节)", pname(r), header.Filename, len(data))
+	log.Printf("chat-file: %s 上传 %s (%d 字节%s)", pname(r), header.Filename, len(data), map[bool]string{true: ", 已落盘", false: ""}[big])
 	json.NewEncoder(w).Encode(map[string]any{"id": id, "mime": header.Header.Get("Content-Type"), "name": header.Filename})
 }
 
@@ -2447,19 +3341,36 @@ func (h *hub) handleChatFileGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", cf.mime)
 	w.Header().Set("Content-Disposition", cd+`; filename="`+strings.ReplaceAll(cf.name, `"`, `_`)+`"`)
+	if cf.path != "" {
+		// 大文件落盘：从磁盘读取（不占内存）
+		data, err := os.ReadFile(cf.path)
+		if err != nil {
+			http.Error(w, "文件读取失败", http.StatusNotFound)
+			return
+		}
+		w.Write(data)
+		return
+	}
 	w.Write(cf.data)
 }
 
-// chatFileCleanup 定时清理过期的大文件（60 分钟）；小文件随聊天历史上限（100 条）截断清理
+// chatFileCleanup 定时清理过期的大文件（配置分钟）；小文件随聊天历史上限截断清理
 func (h *hub) chatFileCleanup() {
 	ticker := time.NewTicker(5 * time.Minute)
 	for range ticker.C {
-		cutoff := time.Now().Add(-60 * time.Minute)
+		expire := h.chatCfg.FileExpire
+		if expire <= 0 {
+			expire = 60
+		}
+		cutoff := time.Now().Add(-time.Duration(expire) * time.Minute)
 		h.mu.Lock()
 		for id, cf := range h.chatFiles {
 			if cf.big && cf.at.Before(cutoff) {
-				h.chatTotalB -= len(cf.data)
+				h.chatTotalB -= int64(len(cf.data))
 				delete(h.chatFiles, id)
+				if cf.path != "" {
+					os.Remove(cf.path) // 删除磁盘文件
+				}
 			}
 		}
 		h.mu.Unlock()
@@ -2770,6 +3681,8 @@ func (h *hub) unregister(p *peer) {
 	h.sfu.removeAllStreams(p.id)
 	h.sfu.removeViewer(p.id)
 	h.broadcast(map[string]any{"type": "peer-left", "id": p.id})
+	h.musicNoPeerTick() // 无人判定（WS 断开）
+	h.musicBroadcast()  // 房间人数变化：刷新"一起听"人数
 }
 
 func sendMsg(p *peer, m map[string]any) {
