@@ -349,6 +349,11 @@
     padding: 4px; display: flex;
   }
   #cinemaControls .ctrl.on { color: #60a5fa; border-color: #60a5fa; }
+  /* 真全屏（覆盖层实现）：隐藏顶部条，控制条 hover 显示（与影院常显区分） */
+  #cinema.fullscreenMode .cinemaBar { display: none; }
+  #cinema.fullscreenMode #cinemaControls .controls { opacity: 0; pointer-events: none; transition: opacity .2s; }
+  #cinema.fullscreenMode #cinemaControls:hover .controls { opacity: 1; pointer-events: auto; }
+  @media (hover: none) { #cinema.fullscreenMode #cinemaControls .controls { opacity: 1; pointer-events: auto; } }
   .netItem { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; background: rgba(255,255,255,0.04); margin-bottom: 6px; font-size: 13px; flex-wrap: wrap; }
   .inviteRow { display: flex; margin-bottom: 6px; }
   .inviteRow .btn { font-size: 12px; }
@@ -980,7 +985,7 @@ let subPending = [];          // subscribe-offer 队列
 let lastResub = 0;            // 订阅 ICE 失败重建防抖
 let wsRtt = null;
 let myWatchers = 0; // 当前观看我的共享的人数
-const appVer = '0.4.0'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
+const appVer = '0.4.1'; // 版本标识（展示用，服务器 /addrs 亦下发 version；刷新判断基于服务器启动时间）
 const sharerCfg = { width: 3840, height: 2160, frameRate: 60, bitrate: 30000000 };
 
 init();
@@ -4679,10 +4684,12 @@ function setTier(streamId, tier) {
   send({ type: 'viewer-config', streamId, tier });
 }
 
-// 重连/新流订阅后恢复用户档位（断线导致 manualTier 被 stream-removed 清理，档位从 localStorage 找回）
+// 重连/新流订阅/重协商后恢复用户档位：始终重发 viewer-config，确保后端层与用户选择一致
+// （后端 ensureSubscriber 在音频/其他流变更触发的重协商中可能重置层——重发强制同步）
 function restoreTier(streamId) {
-  try { saved = localStorage.getItem('teashare_tier_' + streamId); } catch (e) {}
-  if (!saved || manualTier.get(streamId) === saved) return;
+  let saved = '';
+  try { saved = manualTier.get(streamId) || localStorage.getItem('teashare_tier_' + streamId) || ''; } catch (e) {}
+  if (!saved) return;
   manualTier.set(streamId, saved);
   document.querySelectorAll(`select.tierSel[data-stream="${streamId}"]`).forEach(s => s.value = saved);
   send({ type: 'viewer-config', streamId, tier: saved });
@@ -5067,9 +5074,17 @@ function openCinema(streamId) {
 }
 
 function closeCinema() {
+  $('cinema').classList.remove('fullscreenMode');
   $('cinema').hidden = true;
   $('cinemaVideo').srcObject = null;
   $('cinemaStats').innerHTML = '';
+}
+
+// 真全屏：覆盖层实现（不走原生 Fullscreen API——避免浏览器节能导致视频渲染降帧）；
+// 复用影院覆盖层，控制条 hover 显示，Esc 退出
+function openFullscreen(streamId) {
+  openCinema(streamId);
+  $('cinema').classList.add('fullscreenMode');
 }
 
 // 三种观看方式统一入口：网页全屏（影院）/ 真全屏 / 画中画
@@ -5089,9 +5104,7 @@ function activateWatch(kind, streamId) {
     openCinema(streamId);
   } else if (kind === 'fullscreen') {
     watchMode = { kind, id: streamId };
-    focused = streamId;
-    const wrap = video.closest('.videoWrap') || video.closest('.camWrap') || video; // 容器全屏（屏幕/摄像头），控制条随容器进入全屏
-    wrap.requestFullscreen().catch(() => { deactivateWatch('fullscreen'); });
+    openFullscreen(streamId); // 覆盖层实现（避免原生全屏节能降帧）
   } else if (kind === 'pip') {
     pipError = null;
     watchMode = { kind, id: streamId };
@@ -5130,7 +5143,7 @@ function requestPip(video, streamId) {
 
 function deactivateWatch(kind) {
   if (watchMode && watchMode.kind === kind) watchMode = null;
-  if (kind === 'cinema') closeCinema();
+  if (kind === 'cinema' || kind === 'fullscreen') closeCinema();
   if (kind === 'pip' && document.pictureInPictureElement) {
     document.exitPictureInPicture().catch(() => {}); // 切换模式时关闭 PiP 窗口
   }
@@ -5158,7 +5171,7 @@ function updateWatchButtons() {
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && watchMode && watchMode.kind === 'cinema') deactivateWatch('cinema');
+  if (e.key === 'Escape' && watchMode && (watchMode.kind === 'cinema' || watchMode.kind === 'fullscreen')) deactivateWatch(watchMode.kind);
 });
 document.addEventListener('fullscreenchange', () => {
   if (!document.fullscreenElement && watchMode && watchMode.kind === 'fullscreen') {

@@ -53,7 +53,7 @@ const (
 	caCN         = "TeaShare Local CA"
 	caValidDays  = 3650
 	srvValidDays = 365
-	appVersion   = "0.4.0"
+	appVersion   = "0.4.1"
 )
 
 var verboseFlag atomic.Bool // 日志调试模式（-v 启动或运行时 /api/log-level 切换）
@@ -2634,7 +2634,12 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 		if id == viewerID || strings.HasPrefix(id, viewerID+"-") {
 			continue // 不订阅自己（含自己的子流：主视频/摄像头/音频）
 		}
-		local := st.Layers["l"] // 默认档位：流畅（省带宽、更稳定）
+		// 订阅层：优先保留观看者已选档位（vc.tiers），否则默认流畅（省带宽）
+		tier := vc.tiers[id]
+		local := st.Layers[tier]
+		if local == nil {
+			local = st.Layers["l"]
+		}
 		if local == nil {
 			for _, l := range st.Layers {
 				local = l
@@ -2656,7 +2661,6 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 			vc.pc.RemoveTrack(old) //nolint:errcheck
 			old.Stop()
 			delete(vc.senders, id)
-			delete(vc.tiers, id)
 		}
 		sender, err := vc.pc.AddTrack(local)
 		if err != nil {
@@ -2664,7 +2668,10 @@ func (s *SFU) ensureSubscriber(viewerID string) {
 			continue
 		}
 		vc.senders[id] = sender
-		vc.tiers[id] = "l"
+		if tier == "" {
+			tier = "l"
+		}
+		vc.tiers[id] = tier // 保留用户档位（不因其他流变更/重协商重置）
 		go s.forwardPLI(vc, id, sender, st)
 		changed = true
 		logV("subscribe: %s 已订阅流 %s", viewerID, id)
