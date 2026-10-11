@@ -366,9 +366,13 @@
   .netItem code { color: #8fa3c4; font-size: 12px; flex: 1; word-break: break-all; }
   .netItem .btn { flex-shrink: 0; }
   .netDot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .netQr { display: flex; flex-direction: column; align-items: center; gap: 4px; margin: 2px 0 10px; }
-  .netQr svg { width: 150px; height: 150px; background: #fff; padding: 6px; border-radius: 8px; }
-  .netQr .qrHint { font-size: 11px; color: #8fa3c4; }
+  .shareRow { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .shareRow .netItem { flex: 1 1 auto; margin-bottom: 0; min-width: 0; }
+  .shareRow .netQr { flex: none; }
+  .netQr { display: flex; flex-direction: column; align-items: center; gap: 3px; }
+  .netQr svg { width: 128px; height: 128px; background: #fff; padding: 5px; border-radius: 8px; }
+  .netQr .qrHint { font-size: 10px; color: #8fa3c4; white-space: nowrap; }
+  @media (max-width: 520px) { .shareRow { flex-direction: column; align-items: stretch; } .shareRow .netQr { align-self: center; } }
 </style>
 </head>
 <body>
@@ -961,7 +965,7 @@ let _musicPlayHinted = false; // 自动播放被拦截提示防抖
 let wsRetry = 0;      // 连续断线重连计数（≥5 提示主机断线）
 let lastPongT = 0;    // 最近一次收到 pong 的时间（本地心跳超时检测）
 let pasteQueue = [];  // 聊天粘贴候选 [{file, url}]（面板关闭保留，发送后清空）
-let serverStart = 0, pageStartTs = Date.now(), aboutTimer = null, aboutVerbose = false, serverRestarted = false; // 服务器启动时间戳 / 页面加载时间 / 关于弹窗刷新定时器 / 当前日志模式 / 检测到服务器重启
+let serverStart = 0, pageStartTs = Date.now(), aboutTimer = null, aboutVerbose = false, serverRestarted = false, initialServerStart = 0; // 服务器启动时间戳 / 页面加载时间 / 关于弹窗刷新定时器 / 当前日志模式 / 检测到服务器重启 / 本页首次连接基线
 let ipv6Info = null; // 主机 IPv6 检测结果（/addrs 下发；关于弹窗展示）
 // 设备判断（须在 init 调用前声明）：iOS Safari 对 H.264 推流有缺陷（视频停帧仅初始关键帧、音频正常）且不支持 simulcast。
 // 强制 VP8 单层低码率推流；服务器已定时发送 REMB/PLI 保活。判断含 iPadOS 桌面模式（Macintosh 触屏 Safari）；
@@ -1585,7 +1589,8 @@ function connectWS() {
 }
 
 // 拉取服务器状态（/addrs）：初始化与重连成功后共用；
-// 检测服务器重启（启动时间晚于本地缓存）→ 显示「建议刷新」横幅（重连后自动更新缓存时间）
+// 检测服务器重启：以"本页面首次连接时"的启动时间为基线，仅当页面打开期间服务器重启才提示刷新
+// （首次打开页面即随当前服务器加载，已是最新前端，不应提示；localStorage 旧记录不代表本页过时）
 async function refreshServerState() {
   try {
     const r = await fetch('/addrs');
@@ -1597,8 +1602,8 @@ async function refreshServerState() {
     if (d.ipv6) ipv6Info = d.ipv6; // 主机 IPv6 检测结果（关于弹窗展示）
     checkProxyAccess(); // 穿透域名访问检测（每次页面加载询问一次；重连时 proxyAsked 已置位不再弹）
     if (d.serverStart) {
-      const savedStart = localStorage.getItem('teashare_server_start');
-      if (savedStart && d.serverStart > Number(savedStart)) serverRestarted = true;
+      if (!initialServerStart) initialServerStart = d.serverStart; // 首次（本页）：记录基线，不提示
+      else if (d.serverStart > initialServerStart) serverRestarted = true; // 页面打开期间服务器重启 → 提示刷新
       serverStart = d.serverStart;
       localStorage.setItem('teashare_server_start', String(d.serverStart));
     }
@@ -3246,7 +3251,7 @@ function renderAbout() {
   // 服务器已运行：仅连接正常时计算（断开时不再虚增，重连后 refreshServerState 更新 serverStart 恢复准确）
   $('aboutUptime').textContent = wsOpen && serverStart ? fmtDurMs(Date.now() - serverStart) : '连接断开中';
   $('aboutPageUp').textContent = fmtDurMs(Date.now() - pageStartTs);
-  // 本地缓存时间：本地存储的服务器启动时间戳（刷新判断用）
+  // 本地缓存时间：本地存储的服务器启动时间戳（仅展示；重启判断已改用本页基线 initialServerStart）
   let cacheTxt = '-';
   try {
     const sc = localStorage.getItem('teashare_server_start');
@@ -5637,10 +5642,12 @@ function renderShareList() {
   const list = buildShareUrls();
   const el = $('shareList');
   el.innerHTML = list.map(x => `
-    <div class="netItem"><span class="netDot" style="background:#2a9d8f"></span><b>${escapeHtml(x.label)}</b>
-      <code>${escapeHtml(x.url)}</code><button class="btn mini" data-copy="${escapeHtml(x.url)}">复制</button>
-      <button class="btn mini" data-join="${escapeHtml(x.url)}" title="在新标签页打开该主机">加入</button></div>
-    <div class="netQr" data-qr="${escapeHtml(x.url)}"></div>`).join('')
+    <div class="shareRow">
+      <div class="netItem"><span class="netDot" style="background:#2a9d8f"></span><b>${escapeHtml(x.label)}</b>
+        <code>${escapeHtml(x.url)}</code><button class="btn mini" data-copy="${escapeHtml(x.url)}">复制</button>
+        <button class="btn mini" data-join="${escapeHtml(x.url)}" title="在新标签页打开该主机">加入</button></div>
+      <div class="netQr" data-qr="${escapeHtml(x.url)}"></div>
+    </div>`).join('')
     || '<div style="font-size:12px;color:#8fa3c4">暂无可用地址</div>';
   // 每地址渲染二维码（手机扫码直接加入；内联 qrcode-generator）
   el.querySelectorAll('.netQr[data-qr]').forEach(q => {

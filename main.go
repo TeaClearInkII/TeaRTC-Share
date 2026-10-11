@@ -761,14 +761,15 @@ type ctrlReq struct {
 	at             time.Time
 }
 
-// chatFile 聊天上传的文件（大文件落盘，小文件内存缓存）
+// chatFile 聊天上传的文件（持久化开启或大文件落盘，小文件内存缓存）
 type chatFile struct {
-	data []byte // 小文件内存数据（big 时为 nil，从磁盘读）
-	path string // 落盘路径（big 时有效）
+	data []byte // 小文件内存数据（big/落盘时为 nil，从磁盘读）
+	path string // 落盘路径（big/持久化时有效）
 	mime string
 	name string
 	at   time.Time
-	big  bool // 大文件（> 阈值）：按时间过期清理；小文件随聊天历史上限清理
+	big  bool  // 大文件（> 阈值）：按时间过期清理；小文件随聊天历史上限清理
+	size int64 // 文件字节大小（含落盘；用于总量统计与清理）
 }
 
 // chatConfig 聊天配置（config/chat.json；重启生效）
@@ -855,7 +856,8 @@ func newHub() *hub {
 	h.sfu = &SFU{hub: h, streams: make(map[string]*stream), viewers: make(map[string]*viewerConn)}
 	h.chatFiles = make(map[string]*chatFile)
 	h.loadChatConfig()
-	h.loadChatHist() // 从磁盘加载最近历史
+	h.loadChatHist()  // 从磁盘加载最近历史
+	h.loadChatFiles() // 扫描落盘文件（持久化：重启后图片/视频仍可访问）
 	h.musicIndex = -1
 	h.musicCache = make(map[string][]byte)
 	h.musicEnded = make(map[string]bool)
@@ -3123,6 +3125,57 @@ func (h *hub) loadChatHist() {
 	h.mu.Unlock()
 }
 
+// loadChatFiles 启动时扫描 config/chatfiles 恢复聊天文件（持久化：重启后图片/视频仍可访问）
+// mime/name 优先从已加载的聊天历史补全（历史消息持久化了 fileType/fileName），缺失时按内容探测
+func (h *hub) loadChatFiles() {
+	entries, err := os.ReadDir(filepath.Join("config", "chatfiles"))
+	if err != nil {
+		return
+	}
+	bigThr := h.chatCfg.BigThreshold
+	if bigThr <= 0 {
+		bigThr = 20
+	}
+	bigThrB := int64(bigThr) << 20
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		id := e.Name()
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		path := filepath.Join("config", "chatfiles", id)
+		cf := &chatFile{path: path, at: fi.ModTime(), size: fi.Size(), big: fi.Size() > bigThrB}
+		for _, m := range h.chatHist {
+			if fid, _ := m["fileId"].(string); fid == id {
+				cf.mime, _ = m["fileType"].(string)
+				cf.name, _ = m["fileName"].(string)
+				break
+			}
+		}
+		if cf.mime == "" {
+			if f, err := os.Open(path); err == nil {
+				buf := make([]byte, 512)
+				n, _ := f.Read(buf)
+				f.Close()
+				cf.mime = http.DetectContentType(buf[:n])
+			}
+		}
+		if cf.mime == "" {
+			cf.mime = "application/octet-stream"
+		}
+		if cf.name == "" {
+			cf.name = id
+		}
+		h.chatFiles[id] = cf
+		h.chatTotalB += cf.size
+	}
+}
+
 func (p *peer) handleChat(m map[string]any) {
 	h := p.hub
 	text, _ := m["text"].(string)
@@ -3178,7 +3231,10 @@ func (h *hub) appendChat(msg map[string]any) {
 			}
 			if !stillUsed {
 				if cf, ok := h.chatFiles[fid]; ok {
-					h.chatTotalB -= int64(len(cf.data))
+					h.chatTotalB -= cf.size
+					if cf.path != "" {
+						os.Remove(cf.path) // 同步删除落盘文件（避免磁盘残留）
+					}
 				}
 				delete(h.chatFiles, fid)
 			}
@@ -3277,9 +3333,10 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	id := randomCred(8)
 	big := int64(len(data)) > bigThrB
-	cf := &chatFile{mime: header.Header.Get("Content-Type"), name: header.Filename, at: time.Now(), big: big}
-	// 大文件落盘（减少内存占用）；小文件内存缓存
-	if big {
+	persist := big || h.chatCfg.Persist // 持久化开启时所有文件落盘（重启后图片/视频仍可访问）
+	cf := &chatFile{mime: header.Header.Get("Content-Type"), name: header.Filename, at: time.Now(), big: big, size: int64(len(data))}
+	// 落盘（持久化或大文件，减少内存占用）；否则内存缓存
+	if persist {
 		if err := os.MkdirAll("config/chatfiles", 0o755); err == nil {
 			path := filepath.Join("config", "chatfiles", id)
 			if err := os.WriteFile(path, data, 0o600); err == nil {
@@ -3289,7 +3346,7 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if cf.path == "" {
-		cf.data = data // 落盘失败或小文件：内存缓存
+		cf.data = data // 落盘失败或未持久化的小文件：内存缓存
 	}
 	fileTotalMax := int64(h.chatCfg.FileTotal) << 20 // 配置总上限（MB）
 	if fileTotalMax <= 0 {
@@ -3297,7 +3354,7 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	h.chatFiles[id] = cf
-	h.chatTotalB += int64(len(cf.data))
+	h.chatTotalB += cf.size
 	// 总缓存超上限：按最旧优先删除（保留新文件），直到放下
 	need := h.chatTotalB
 	if need > fileTotalMax {
@@ -3315,7 +3372,7 @@ func (h *hub) handleChatFileUpload(w http.ResponseWriter, r *http.Request) {
 				continue // 保留新文件
 			}
 			del := h.chatFiles[it.id]
-			sz := int64(len(del.data))
+			sz := del.size
 			delete(h.chatFiles, it.id)
 			h.chatTotalB -= sz
 			need -= sz
@@ -3343,7 +3400,8 @@ func pname(r *http.Request) string {
 // handleChatFileGet GET /api/chat-file/{id}
 func (h *hub) handleChatFileGet(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/chat-file/")
-	if id == "" {
+	// id 仅允许随机凭据字符（不含路径分隔/点，防路径穿越）
+	if id == "" || len(id) > 64 || strings.ContainsAny(id, `/\*?"<>|.`) {
 		http.Error(w, "missing id", http.StatusBadRequest)
 		return
 	}
@@ -3351,7 +3409,20 @@ func (h *hub) handleChatFileGet(w http.ResponseWriter, r *http.Request) {
 	cf := h.chatFiles[id]
 	h.mu.Unlock()
 	if cf == nil {
-		http.Error(w, "文件不存在或已过期", http.StatusNotFound)
+		// 内存无记录：兜底尝试磁盘落盘文件（启动加载竞态/条目缺失时仍可访问）
+		data, err := os.ReadFile(filepath.Join("config", "chatfiles", id))
+		if err != nil {
+			http.Error(w, "文件不存在或已过期", http.StatusNotFound)
+			return
+		}
+		mime := http.DetectContentType(data[:min(512, len(data))])
+		cd := `attachment`
+		if strings.HasPrefix(mime, "image/") || strings.HasPrefix(mime, "video/") {
+			cd = `inline`
+		}
+		w.Header().Set("Content-Type", mime)
+		w.Header().Set("Content-Disposition", cd+`; filename="`+id+`"`)
+		w.Write(data)
 		return
 	}
 	cd := `inline` // 图片/视频内联预览播放；其余附件下载
@@ -3385,7 +3456,7 @@ func (h *hub) chatFileCleanup() {
 		h.mu.Lock()
 		for id, cf := range h.chatFiles {
 			if cf.big && cf.at.Before(cutoff) {
-				h.chatTotalB -= int64(len(cf.data))
+				h.chatTotalB -= cf.size
 				delete(h.chatFiles, id)
 				if cf.path != "" {
 					os.Remove(cf.path) // 删除磁盘文件
