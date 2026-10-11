@@ -53,7 +53,7 @@ const (
 	caCN         = "TeaShare Local CA"
 	caValidDays  = 3650
 	srvValidDays = 365
-	appVersion   = "0.4.1"
+	appVersion   = "0.4.2"
 )
 
 var verboseFlag atomic.Bool // 日志调试模式（-v 启动或运行时 /api/log-level 切换）
@@ -713,6 +713,7 @@ type hub struct {
 	streamCfgs map[string]map[string]any // streamId -> 共享者最新配置
 
 	chatHist   []map[string]any     // 聊天历史（最近 N 条，重启清空；新成员可见）
+	chatSeq    int64                // 聊天消息单调序号（前端据此去重，避免历史/实时/重连重复渲染）
 	chatFiles  map[string]*chatFile // 聊天文件缓存（内存，重启清空，过期清理）
 	chatCfg    chatConfig           // 聊天配置（config/chat.json）
 	chatLogMu  sync.Mutex           // 聊天持久化日志写锁
@@ -3107,6 +3108,15 @@ func (h *hub) loadChatHist() {
 	for _, ln := range lines {
 		var m map[string]any
 		if json.Unmarshal(ln, &m) == nil && m["type"] == "chat" {
+			// 兼容旧记录（无 seq）：按加载顺序补单调 seq；新记录（有 seq）取最大值续号
+			if s, ok := m["seq"].(float64); ok {
+				if int64(s) > h.chatSeq {
+					h.chatSeq = int64(s)
+				}
+			} else {
+				h.chatSeq++
+				m["seq"] = h.chatSeq
+			}
 			h.chatHist = append(h.chatHist, m)
 		}
 	}
@@ -3143,6 +3153,8 @@ func (p *peer) handleChat(m map[string]any) {
 // appendChat 本地广播 + 写入聊天历史（含历史截断与文件缓存清理）
 func (h *hub) appendChat(msg map[string]any) {
 	h.mu.Lock()
+	h.chatSeq++
+	msg["seq"] = h.chatSeq // 单调递增序号：前端据此去重（历史/实时/重连不会重复渲染）
 	h.chatHist = append(h.chatHist, msg)
 	keep := h.chatCfg.HistKeep
 	if keep <= 0 {

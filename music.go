@@ -81,9 +81,9 @@ func parseMusicURL(u string) ([]MusicItem, error) {
 type neteaseParser struct{}
 
 var (
-	neteaseSongRe     = regexp.MustCompile(`music\.163\.com/(?:#/)?song\?id=(\d+)`)
-	neteaseSongAltRe  = regexp.MustCompile(`music\.163\.com/(?:#/)?song/(\d+)`)
-	neteasePlaylistRe = regexp.MustCompile(`music\.163\.com/(?:#/)?playlist\?id=(\d+)`)
+	neteaseSongRe     = regexp.MustCompile(`music\.163\.com/(?:#/|m/)?song\?id=(\d+)`)
+	neteaseSongAltRe  = regexp.MustCompile(`music\.163\.com/(?:#/|m/)?song/(\d+)`)
+	neteasePlaylistRe = regexp.MustCompile(`music\.163\.com/(?:#/|m/)?playlist\?id=(\d+)`)
 )
 
 func (p *neteaseParser) Match(u string) bool { return strings.Contains(u, "music.163.com") }
